@@ -74,7 +74,7 @@ Only `doctor` and `list_windows` currently work. The following tools are adverti
 
 ### Chrome extension status
 
-The `extension/` directory contains an extension based on the mac-use Chrome extension. The Linux server does not yet connect MCP browser requests to the extension, so browser automation is unavailable. Registering or loading the extension does not enable `browser_open`, `browser_snapshot`, `browser_act`, `browser_close`, or `browser_status` functionality. Do not use it expecting browser control.
+The `extension/` directory contains an extension based on the mac-use Chrome extension. The Linux server does not yet connect MCP browser requests to the extension, so browser automation is unavailable. Registering or loading the extension does not enable `browser_open`, `browser_snapshot`, `browser_act`, `browser_close`, or `browser_status` functionality. Its standalone `browser_close` handler best-effort removes only tabs it created that still appear inactive and were not selected by the user; the Linux MCP server cannot invoke that behavior. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Do not use this project expecting browser control.
 
 ### Tests
 
@@ -157,7 +157,7 @@ Actualmente solo funcionan `doctor` y `list_windows`. Estas herramientas se anun
 
 ### Estado de la extensión de Chrome
 
-La carpeta `extension/` contiene una extensión basada en la extensión de Chrome de mac-use. El servidor Linux todavía no conecta las solicitudes MCP del navegador con la extensión, por lo que la automatización del navegador no está disponible. Cargar o registrar la extensión no habilita las funciones `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ni `browser_status`. No la uses esperando poder controlar el navegador.
+La carpeta `extension/` contiene una extensión basada en la extensión de Chrome de mac-use. El servidor Linux todavía no conecta las solicitudes MCP del navegador con la extensión, por lo que la automatización del navegador no está disponible. Cargar o registrar la extensión no habilita las funciones `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ni `browser_status`. El controlador independiente `browser_close` intenta cerrar únicamente las pestañas que creó y que siguen inactivas y no fueron seleccionadas por el usuario; el servidor MCP de Linux no puede invocar ese comportamiento. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña, así que una selección que coincida con la eliminación todavía podría cerrarse. No uses este proyecto esperando poder controlar el navegador.
 
 ### Pruebas
 
@@ -240,7 +240,7 @@ Atualmente, somente `doctor` e `list_windows` funcionam. Estas ferramentas são 
 
 ### Estado da extensão do Chrome
 
-A pasta `extension/` contém uma extensão baseada na extensão Chrome do mac-use. O servidor Linux ainda não conecta as solicitações MCP do navegador à extensão, portanto a automação do navegador não está disponível. Carregar ou registrar a extensão não habilita as funções `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ou `browser_status`. Não a utilize esperando conseguir controlar o navegador.
+A pasta `extension/` contém uma extensão baseada na extensão Chrome do mac-use. O servidor Linux ainda não conecta as solicitações MCP do navegador à extensão, portanto a automação do navegador não está disponível. Carregar ou registrar a extensão não habilita as funções `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ou `browser_status`. O manipulador independente `browser_close` tenta fechar somente abas que criou e que ainda parecem inativas e não foram selecionadas pelo usuário; o servidor MCP do Linux não consegue acionar esse comportamento. O Chrome não torna atômicas a verificação de atividade e a remoção da aba, portanto uma seleção que coincida com a remoção ainda pode resultar no fechamento. Não use este projeto esperando conseguir controlar o navegador.
 
 ### Testes
 

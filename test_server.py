@@ -17,6 +17,9 @@ class MCPTests(unittest.TestCase):
     def test_stdio_calls_and_unknown_method(self):
         result = server.handle({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"doctor", "arguments":{}}})
         self.assertIn('"x11_only": true', result["result"]["content"][0]["text"])
+        capabilities = json.loads(result["result"]["content"][0]["text"])
+        self.assertIn("browser_close", capabilities["unsupported"])
+        self.assertIn("browser_status", capabilities["unsupported"])
         self.assertEqual(server.handle({"jsonrpc":"2.0", "id":4, "method":"unknown"})["error"]["code"], -32601)
 
     def test_native_actions_fail_closed_and_require_explicit_target_token(self):

@@ -91,7 +91,7 @@ def call_tool(name, args):
         return text_result({"platform": sys.platform, "display": bool(os.environ.get("DISPLAY")), "session_type": os.environ.get("XDG_SESSION_TYPE"),
                             "x11_only": True, "wmctrl": shutil.which("wmctrl"), "xdotool": shutil.which("xdotool"),
                             "supported_native_tools": ["list_windows"] if x11_available() else [],
-                            "unsupported": [x for x in BASE_TOOLS if x not in ("doctor", "list_windows", "browser_status", "browser_close")]})
+                            "unsupported": [x for x in BASE_TOOLS if x not in ("doctor", "list_windows")]})
     if name == "list_windows":
         if args.get("bundle_id"):
             raise Unsupported("bundle_id filtering is not available on Linux; use target PID/window ID from the returned list.")
