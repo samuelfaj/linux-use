@@ -1,6 +1,6 @@
 # linux-use
 
-An X11-only Linux MCP server inspired by mac-use. This prototype currently supports environment diagnostics and window listing; native window control and Chrome tab automation are not implemented.
+A Linux MCP server inspired by mac-use. Native desktop controls require X11 and the corresponding utilities. Chrome tab automation is available through the separately registered extension. Jev decisions are available for owned Chrome tabs with structured controls. Native Linux windows use a screenshot-to-MCP-caller visual-model fallback; screenshots are not sent to Jev, and Linux Accessibility is not implemented.
 
 [English](#english) | [Español](#español) | [Português (Brasil)](#português-brasil)
 
@@ -10,18 +10,19 @@ An X11-only Linux MCP server inspired by mac-use. This prototype currently suppo
 
 ### What works today
 
-`linux-use` provides an MCP server over standard input and output. On an X11 session, `doctor` reports the environment and `list_windows` returns window IDs, process IDs, and titles. The server advertises the mac-use tool names for compatibility, but all other native actions return an explicit unsupported error. Wayland is not supported.
+`linux-use` provides an MCP server over standard input and output. On an X11 session, `doctor` reports the environment and `list_windows` returns window IDs, process IDs, and titles. `screenshot`, `left_click`, `type`, `key`, and `scroll` are available for explicitly identified windows with a fresh state token; other native actions return an explicit unsupported error. Wayland is not supported.
 
-The project fails closed rather than activating windows, injecting input, or claiming safety checks it cannot provide. In particular, screenshots, Accessibility trees, state-token validation, human-activity detection, clicks, typing, semantic actions, and Jev advice are unavailable.
+The project fails closed rather than activating windows or claiming safety checks it cannot provide. Screenshot payloads include the target PID/window ID, geometry, and a state token derived from the target identity and captured pixels. The MCP caller can use the image for visual reasoning and submit a bounded, one-use `native_visual_propose`; a separate `native_visual_execute` call rechecks the exact target and pixels immediately before input. Proposals expire after two minutes, are limited to 32 pending items, and are consumed once. A state token binds the screenshot state but does not prove that a model examined the image or that an action is authorized. Native Linux Accessibility and human-activity detection remain unavailable. Jev advises on filtered structured controls only for an owned Chrome tab; native screenshots are not sent to Jev.
 
 ### Requirements
 
 - Linux with an X11 desktop session (`echo "$XDG_SESSION_TYPE"` should print `x11`)
 - Python 3
 - `wmctrl`
+- `xdotool` for input and active-window verification, `xwd` for screenshots, and ImageMagick `convert` or `magick` to encode PNG screenshots
 - An MCP client: Distill, Codex, Claude Code, or Grok Build
 
-Wayland sessions are unsupported. `xdotool` is not used to perform input; no input actions are implemented.
+Wayland sessions are unsupported. Screenshot requires `xwd`; input actions require `xdotool`. If either utility is unavailable, that operation fails with a precise error.
 
 ### 1. Install and run the MCP server
 
@@ -70,11 +71,11 @@ If the client was already open, restart it after adding the server. Keep the rep
 
 Call `doctor` to see whether an X11 display is available and whether the required utilities are installed. Call `list_windows` to list visible X11 window candidates. Window titles and process IDs may contain private information; treat the result accordingly.
 
-Only `doctor` and `list_windows` currently work. The following tools are advertised but return an unsupported error: `screenshot`, `zoom`, `cursor_position`, `get_ui_tree`, `jev_decide`, `left_click`, `type`, `click_element`, and the browser tools.
+`doctor`, `list_windows`, `restore_window`, `screenshot`, `left_click`, `type`, `key`, `scroll`, `native_visual_propose`, and `native_visual_execute` are available on X11 when their required utilities are installed. For native windows, the screenshot image goes to the MCP caller's visual model; the server does not send it to Jev. Proposals are separate from execution and are bound to the exact target and screenshot token, which the server revalidates before input. Jev remains available only for an owned Chrome tab with credentials and structured controls; it does not decide native Linux actions. Browser tools route through the registered Chrome native-messaging host and fail closed when disconnected.
 
 ### Chrome extension status
 
-The `extension/` directory contains an extension based on the mac-use Chrome extension. The Linux server does not yet connect MCP browser requests to the extension, so browser automation is unavailable. Registering or loading the extension does not enable `browser_open`, `browser_snapshot`, `browser_act`, `browser_close`, or `browser_status` functionality. Its standalone `browser_close` handler best-effort removes only tabs it created that still appear inactive and were not selected by the user; the Linux MCP server cannot invoke that behavior. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed. Do not use this project expecting browser control.
+The extension connects to the Linux MCP server through Chrome native messaging and a mode-0600 Unix socket under `~/.local/share/linux-use`. Register it using `python3 server.py install-chrome-host EXTENSION_ID`, then click the extension icon to connect. Browser automation is independent of the X11-only native desktop backend. Owned tabs are created inactive; the extension refuses reads or actions after human takeover and only best-effort closes tabs that remain inactive. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed.
 
 ### Tests
 
@@ -93,18 +94,20 @@ These tests cover MCP/helper behavior and the extension's mocked tab-ownership l
 
 ### Qué funciona actualmente
 
-`linux-use` ofrece un servidor MCP mediante la entrada y salida estándar. En una sesión X11, `doctor` informa sobre el entorno y `list_windows` devuelve los identificadores de las ventanas y de los procesos, además de sus títulos. El servidor anuncia los nombres de herramientas de mac-use por compatibilidad, pero las demás acciones nativas devuelven un error explícito de función no disponible. Wayland no es compatible.
+`linux-use` ofrece un servidor MCP mediante la entrada y salida estándar. En una sesión X11, `doctor` informa sobre el entorno y `list_windows` devuelve identificadores de ventana, PID y títulos. También admite capturas PNG y acciones de clic izquierdo, escritura, teclas y desplazamiento en una ventana identificada explícitamente y con un token de estado vigente. Wayland no es compatible.
 
-El proyecto falla de forma segura en lugar de activar ventanas, inyectar entradas o afirmar que realiza comprobaciones de seguridad que no puede proporcionar. No están disponibles las capturas de pantalla, los árboles de Accesibilidad, la validación de tokens de estado, la detección de actividad humana, los clics, la escritura, las acciones semánticas ni las recomendaciones de Jev.
+Las capturas devuelven la imagen al modelo visual del cliente MCP, no a Jev. El modelo puede registrar una propuesta nativa de un solo uso con `native_visual_propose`; `native_visual_execute` vuelve a validar la ventana y los píxeles antes de enviar la entrada. Las propuestas vencen en dos minutos, hay un máximo de 32 y cada una se consume una sola vez. El token vincula el estado de la captura, pero no demuestra quién tomó la decisión ni que exista autorización. La Accesibilidad nativa sigue sin estar disponible. Jev asesora sobre controles estructurados de una pestaña Chrome propia; no decide acciones nativas de Linux.
 
 ### Requisitos
 
 - Linux con una sesión de escritorio X11 (`echo "$XDG_SESSION_TYPE"` debería mostrar `x11`)
 - Python 3
 - `wmctrl`
+- `xdotool` para acciones de entrada y comprobar la ventana activa
+- `xwd` e ImageMagick (`convert` o `magick`) para capturas PNG
 - Un cliente MCP: Distill, Codex, Claude Code o Grok Build
 
-Las sesiones Wayland no son compatibles. `xdotool` no se utiliza para inyectar entradas; no hay acciones de entrada implementadas.
+Las sesiones Wayland no son compatibles. Si falta alguna utilidad necesaria, la operación correspondiente informa del error sin ejecutarse.
 
 ### 1. Instalar e iniciar el servidor MCP
 
@@ -153,11 +156,11 @@ Si el cliente ya estaba abierto, reinícialo después de añadir el servidor. Co
 
 Llama a `doctor` para comprobar si hay una pantalla X11 disponible y si están instaladas las utilidades necesarias. Llama a `list_windows` para obtener las ventanas X11 detectadas. Los títulos y los identificadores de procesos pueden contener información privada; trata estos resultados con cuidado.
 
-Actualmente solo funcionan `doctor` y `list_windows`. Estas herramientas se anuncian, pero devuelven un error de función no disponible: `screenshot`, `zoom`, `cursor_position`, `get_ui_tree`, `jev_decide`, `left_click`, `type`, `click_element` y las herramientas del navegador.
+Funcionan `doctor`, `list_windows`, `restore_window`, `screenshot`, `left_click`, `type`, `key`, `scroll`, `native_visual_propose` y `native_visual_execute` cuando están instaladas las utilidades requeridas. La imagen se entrega al modelo visual del cliente MCP, no a Jev. La propuesta se vincula al objetivo y al token; la ejecución la revalida y consume una sola vez. Jev decide sobre controles estructurados de una pestaña Chrome propia, no sobre ventanas Linux nativas. `zoom`, `cursor_position`, `get_ui_tree` y `click_element` siguen sin estar disponibles.
 
 ### Estado de la extensión de Chrome
 
-La carpeta `extension/` contiene una extensión basada en la extensión de Chrome de mac-use. El servidor Linux todavía no conecta las solicitudes MCP del navegador con la extensión, por lo que la automatización del navegador no está disponible. Cargar o registrar la extensión no habilita las funciones `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ni `browser_status`. El controlador independiente `browser_close` intenta cerrar únicamente las pestañas que creó y que siguen inactivas y no fueron seleccionadas por el usuario; el servidor MCP de Linux no puede invocar ese comportamiento. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña, así que una selección que coincida con la eliminación todavía podría cerrarse. No uses este proyecto esperando poder controlar el navegador.
+La carpeta `extension/` contiene la extensión de Chrome. Registra el host con `python3 server.py install-chrome-host EXTENSION_ID` y haz clic en el icono de la extensión para conectar. El servidor MCP reenvía las solicitudes mediante un socket Unix local con permisos restringidos. La automatización del navegador es independiente de los controles de escritorio X11. Las pestañas propias se crean en segundo plano; la extensión deja de actuar cuando detecta que el usuario seleccionó una pestaña. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña, así que una selección que coincida con la eliminación todavía podría cerrarse.
 
 ### Pruebas
 
@@ -176,18 +179,20 @@ Estas pruebas cubren el comportamiento MCP y las funciones auxiliares, además d
 
 ### O que funciona atualmente
 
-O `linux-use` oferece um servidor MCP por entrada e saída padrão. Em uma sessão X11, `doctor` informa o estado do ambiente e `list_windows` retorna os identificadores das janelas e dos processos, além dos títulos. O servidor anuncia os nomes das ferramentas do mac-use por compatibilidade, mas as demais ações nativas retornam um erro explícito de recurso não disponível. Wayland não é compatível.
+O `linux-use` oferece um servidor MCP por entrada e saída padrão. Em uma sessão X11, `doctor` informa o estado do ambiente e `list_windows` retorna IDs de janela, PID e títulos. Também são suportadas capturas PNG e ações de clique esquerdo, digitação, teclas e rolagem em uma janela identificada explicitamente e com token de estado atual. Wayland não é compatível.
 
-O projeto falha de forma segura em vez de ativar janelas, injetar entradas ou alegar verificações de segurança que não consegue oferecer. Capturas de tela, árvores de Acessibilidade, validação de tokens de estado, detecção de atividade humana, cliques, digitação, ações semânticas e recomendações do Jev não estão disponíveis.
+As ações de entrada revalidam a identidade e o estado visual da janela antes do envio. As capturas exigem `xwd` e ImageMagick; as ações de entrada exigem `xdotool`. Acessibilidade e ações semânticas nativas ainda não estão disponíveis. O Jev pode avaliar controles filtrados de uma aba própria do Chrome; ele não controla janelas nativas. A automação do navegador funciona pela extensão registrada separadamente.
 
 ### Requisitos
 
 - Linux com uma sessão gráfica X11 (`echo "$XDG_SESSION_TYPE"` deve exibir `x11`)
 - Python 3
 - `wmctrl`
+- `xdotool` para ações de entrada e verificação da janela ativa
+- `xwd` e ImageMagick (`convert` ou `magick`) para capturas PNG
 - Um cliente MCP: Distill, Codex, Claude Code ou Grok Build
 
-Sessões Wayland não são compatíveis. O `xdotool` não é usado para injetar entradas; nenhuma ação de entrada está implementada.
+Sessões Wayland não são compatíveis. Se uma ferramenta necessária estiver ausente, a operação correspondente informa o erro sem executá-la.
 
 ### 1. Instale e inicie o servidor MCP
 
@@ -236,11 +241,11 @@ Se o cliente já estiver aberto, reinicie-o depois de adicionar o servidor. Mant
 
 Chame `doctor` para verificar se há uma tela X11 disponível e se os utilitários necessários estão instalados. Chame `list_windows` para listar as janelas X11 encontradas. Os títulos das janelas e os identificadores de processos podem conter informações privadas; trate esses dados com cuidado.
 
-Atualmente, somente `doctor` e `list_windows` funcionam. Estas ferramentas são anunciadas, mas retornam erro de recurso não disponível: `screenshot`, `zoom`, `cursor_position`, `get_ui_tree`, `jev_decide`, `left_click`, `type`, `click_element` e as ferramentas do navegador.
+Funcionam `doctor`, `list_windows`, `restore_window`, `screenshot`, `left_click`, `type`, `key`, `scroll`, `native_visual_propose` e `native_visual_execute` quando os utilitários necessários estão instalados. A imagem é entregue ao modelo visual do cliente MCP, não ao Jev. A proposta fica vinculada ao alvo e ao token; a execução revalida o estado e consome a proposta uma única vez. O Jev decide usando controles estruturados de uma aba própria do Chrome, não janelas Linux nativas. `zoom`, `cursor_position`, `get_ui_tree` e `click_element` continuam indisponíveis.
 
 ### Estado da extensão do Chrome
 
-A pasta `extension/` contém uma extensão baseada na extensão Chrome do mac-use. O servidor Linux ainda não conecta as solicitações MCP do navegador à extensão, portanto a automação do navegador não está disponível. Carregar ou registrar a extensão não habilita as funções `browser_open`, `browser_snapshot`, `browser_act`, `browser_close` ou `browser_status`. O manipulador independente `browser_close` tenta fechar somente abas que criou e que ainda parecem inativas e não foram selecionadas pelo usuário; o servidor MCP do Linux não consegue acionar esse comportamento. O Chrome não torna atômicas a verificação de atividade e a remoção da aba, portanto uma seleção que coincida com a remoção ainda pode resultar no fechamento. Não use este projeto esperando conseguir controlar o navegador.
+A pasta `extension/` contém a extensão do Chrome. Registre o host com `python3 server.py install-chrome-host EXTENSION_ID` e clique no ícone da extensão para conectar. O servidor MCP encaminha as solicitações por um socket Unix local com permissões restritas. A automação do navegador é independente dos controles de desktop X11. As abas próprias são abertas em segundo plano; a extensão para de agir quando detecta que o usuário selecionou uma aba. O Chrome não torna atômicas a verificação de atividade e a remoção da aba, então uma seleção simultânea à remoção ainda pode resultar no fechamento.
 
 ### Testes
 

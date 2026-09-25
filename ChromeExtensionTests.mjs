@@ -74,6 +74,53 @@ globalThis.chrome = {
 
 const {handleRequest, pageOperation} = await import('./extension/background.js');
 
+test('browser_act rejects a reused element whose label changes after its snapshot', () => {
+  let label = 'Save';
+  let isVisible = true;
+  let newHandlerCalls = 0;
+  const button = {
+    tagName: 'BUTTON', type: 'button', disabled: false, readOnly: false, value: '', innerText: '', labels: [],
+    isConnected: true,
+    getAttribute(name) { return name === 'aria-label' ? label : null; },
+    click() { newHandlerCalls++; },
+  };
+  const previous = {
+    document: globalThis.document,
+    getComputedStyle: globalThis.getComputedStyle,
+    location: globalThis.location,
+    snapshot: globalThis.__macUseSnapshot,
+  };
+  try {
+    globalThis.document = {
+      visibilityState: 'hidden', readyState: 'complete', title: 'test', body: {innerText: ''},
+      querySelectorAll() { return [button]; },
+    };
+    globalThis.getComputedStyle = () => ({visibility: 'visible', display: 'block', opacity: isVisible ? '1' : '0'});
+    globalThis.location = {href: 'https://example.test/'};
+    button.getBoundingClientRect = () => ({width: 50, height: 20});
+    const snapshot = pageOperation('browser_snapshot', {});
+    const ref = snapshot.elements[0].ref;
+    label = 'Delete';
+    assert.throws(() => pageOperation('browser_act', {action: 'click', ref}), /stale_reference/);
+    assert.equal(newHandlerCalls, 0);
+    label = 'Save';
+    const refreshedRef = pageOperation('browser_snapshot', {}).elements[0].ref;
+    isVisible = false;
+    assert.throws(() => pageOperation('browser_act', {action: 'click', ref: refreshedRef}), /stale_reference/);
+    assert.equal(newHandlerCalls, 0);
+  } finally {
+    for (const [key, value] of Object.entries({
+      document: previous.document,
+      getComputedStyle: previous.getComputedStyle,
+      location: previous.location,
+      __macUseSnapshot: previous.snapshot,
+    })) {
+      if (value === undefined) delete globalThis[key];
+      else globalThis[key] = value;
+    }
+  }
+});
+
 test('a newly selected tab cannot be read or mutated during the script race', () => {
   globalThis.document = {visibilityState: 'visible'};
   assert.throws(() => pageOperation('browser_snapshot', {}), /human_activity/);
@@ -86,6 +133,15 @@ async function openSession(id) {
   await handleRequest({operation: 'browser_open', session, arguments: {url: 'https://example.com/'}});
   return {session, tabId: currentTabId};
 }
+
+test('browser_status reports the live profile and whether this session owns a tab', async () => {
+  const session = '00000000-0000-0000-0000-000000000099';
+  assert.deepEqual(await handleRequest({operation: 'browser_status', session}),
+    {connected: true, mode: 'current_chrome_profile', hasTab: false});
+  await handleRequest({operation: 'browser_open', session, arguments: {url: 'https://example.com/'}});
+  assert.deepEqual(await handleRequest({operation: 'browser_status', session}),
+    {connected: true, mode: 'current_chrome_profile', hasTab: true});
+});
 
 test('browser_close removes an owned tab that is still inactive', async () => {
   const {session, tabId} = await openSession(1);
