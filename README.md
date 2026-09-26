@@ -67,6 +67,19 @@ Run **one** command for the client you use, from inside the `linux-use` folder:
 
 If the client was already open, restart it after adding the server. Keep the repository at the same path; the client starts `server.py` from there.
 
+### Install the agent skill globally
+
+Install the bundled [linux-use skill](skills/linux-use/SKILL.md) from this repository for Codex, Claude Code, and Distill/Grok Build (which share `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/linux-use"
+  cp "skills/linux-use/SKILL.md" "$root/linux-use/SKILL.md"
+done
+```
+
+Start a new client session after installation. The skill requires agents to close resources they create, including after failures, preserve user-owned resources, and verify cleanup. The MCP also advertises a cleanup reminder. This is agent guidance, not an automatic sandbox; the shared Chrome profile retains normal history and site state.
+
 ### 3. Check the Linux session
 
 Call `doctor` to see whether an X11 display is available and whether the required utilities are installed. Call `list_windows` to list visible X11 window candidates. Window titles and process IDs may contain private information; treat the result accordingly.
@@ -152,6 +165,19 @@ Ejecuta **un solo** comando para el cliente que utilices, desde la carpeta `linu
 
 Si el cliente ya estaba abierto, reinícialo después de añadir el servidor. Conserva el repositorio en la misma ruta; el cliente inicia `server.py` desde allí.
 
+### Instalar la skill del agente globalmente
+
+Instala la [skill linux-use](skills/linux-use/SKILL.md) incluida en este repositorio para Codex, Claude Code y Distill/Grok Build (que comparten `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/linux-use"
+  cp "skills/linux-use/SKILL.md" "$root/linux-use/SKILL.md"
+done
+```
+
+Inicia una sesión nueva del cliente después de instalarla. La skill exige cerrar los recursos creados por el agente incluso ante errores, preservar los recursos del usuario y verificar la limpieza. El MCP también comunica un recordatorio. Son instrucciones para el agente, no un entorno aislado automático; el perfil compartido de Chrome conserva su historial y los datos de los sitios.
+
 ### 3. Comprobar la sesión de Linux
 
 Llama a `doctor` para comprobar si hay una pantalla X11 disponible y si están instaladas las utilidades necesarias. Llama a `list_windows` para obtener las ventanas X11 detectadas. Los títulos y los identificadores de procesos pueden contener información privada; trata estos resultados con cuidado.
@@ -236,6 +262,19 @@ Execute **apenas um** comando para o cliente que você usa, dentro da pasta `lin
   ```
 
 Se o cliente já estiver aberto, reinicie-o depois de adicionar o servidor. Mantenha o repositório no mesmo caminho; o cliente inicia o `server.py` a partir dele.
+
+### Instale a skill do agente globalmente
+
+Instale a [skill linux-use](skills/linux-use/SKILL.md) incluída neste repositório para Codex, Claude Code e Distill/Grok Build (que compartilham `~/.grok/skills`):
+
+```sh
+for root in "$HOME/.codex/skills" "$HOME/.claude/skills" "$HOME/.grok/skills"; do
+  mkdir -p "$root/linux-use"
+  cp "skills/linux-use/SKILL.md" "$root/linux-use/SKILL.md"
+done
+```
+
+Inicie uma nova sessão do cliente após instalar. A skill exige fechar os recursos criados pelo agente inclusive em caso de erro, preservar os recursos do usuário e verificar a limpeza. O MCP também fornece um lembrete. São instruções para o agente, não um isolamento automático; o perfil compartilhado do Chrome mantém histórico e dados dos sites.
 
 ### 3. Confira a sessão Linux
 
