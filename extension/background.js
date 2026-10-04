@@ -3,6 +3,7 @@ const sessions = new Map();
 let creatingTab = false;
 const activatedDuringCreation = new Set();
 let port;
+let connectedAt = 0;
 let requests = Promise.resolve();
 
 // Runs in this extension's isolated world, without changing page attributes
@@ -173,7 +174,7 @@ function badge(text, title) {
 function disconnected(connection, error) {
   if (port !== connection) return;
   port = undefined;
-  badge('OFF', error || 'mac-use disconnected. Click to reconnect.');
+  badge('OFF', error || 'mac-use disconnected. Reconnecting automatically; click to retry now.');
   // Let any running request settle before releasing session handles.
   requests = requests.then(async () => {
     for (const session of [...sessions.keys()]) {
@@ -186,7 +187,8 @@ function connect() {
   if (port) return;
   const connection = chrome.runtime.connectNative(hostName);
   port = connection;
-  badge('ON', 'mac-use connected. Click to disconnect.');
+  connectedAt = Date.now();
+  badge('ON', 'mac-use connected. Reconnects automatically.');
   connection.onMessage.addListener(request => {
     requests = requests.then(async () => {
       if (port !== connection) return;
@@ -198,7 +200,9 @@ function connect() {
   });
   connection.onDisconnect.addListener(() => {
     const error = chrome.runtime.lastError?.message;
+    const livedMs = Date.now() - connectedAt;
     disconnected(connection, error);
+    if (livedMs >= 5000) setTimeout(connect, 1000);
   });
 }
 
@@ -210,11 +214,12 @@ chrome.tabs.onRemoved.addListener(tabId => {
   for (const [session, entry] of sessions) if (entry.tabId === tabId) sessions.delete(session);
 });
 chrome.action.onClicked.addListener(() => {
-  if (port) {
-    const connection = port;
-    disconnected(connection);
-    connection.disconnect();
-  } else connect();
+  if (!port) connect();
 });
 chrome.runtime.onInstalled.addListener(connect);
 chrome.runtime.onStartup.addListener(connect);
+connect();
+chrome.alarms.create('keep-connected', {periodInMinutes: 0.5});
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'keep-connected') connect();
+});

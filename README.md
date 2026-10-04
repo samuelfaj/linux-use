@@ -88,7 +88,7 @@ Call `doctor` to see whether an X11 display is available and whether the require
 
 ### Chrome extension status
 
-The extension connects to the Linux MCP server through Chrome native messaging and a mode-0600 Unix socket under `~/.local/share/linux-use`. Register it using `python3 server.py install-chrome-host EXTENSION_ID`, then click the extension icon to connect. Browser automation is independent of the X11-only native desktop backend. Owned tabs are created inactive; the extension refuses reads or actions after human takeover and only best-effort closes tabs that remain inactive. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed.
+The extension connects to the Linux MCP server through Chrome native messaging and a mode-0600 Unix socket under `~/.local/share/linux-use`. Register it using `python3 server.py install-chrome-host EXTENSION_ID`, and the extension connects by itself, reconnecting automatically every 30 seconds if the link drops (clicking the icon retries at once). Browser automation is independent of the X11-only native desktop backend. Owned tabs are created inactive; the extension refuses reads or actions after human takeover and only best-effort closes tabs that remain inactive. Chrome cannot make the activity check and tab removal atomic, so a selection racing with removal may still be closed.
 
 ### Tests
 
@@ -186,7 +186,7 @@ Funcionan `doctor`, `list_windows`, `restore_window`, `screenshot`, `left_click`
 
 ### Estado de la extensión de Chrome
 
-La carpeta `extension/` contiene la extensión de Chrome. Registra el host con `python3 server.py install-chrome-host EXTENSION_ID` y haz clic en el icono de la extensión para conectar. El servidor MCP reenvía las solicitudes mediante un socket Unix local con permisos restringidos. La automatización del navegador es independiente de los controles de escritorio X11. Las pestañas propias se crean en segundo plano; la extensión deja de actuar cuando detecta que el usuario seleccionó una pestaña. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña, así que una selección que coincida con la eliminación todavía podría cerrarse.
+La carpeta `extension/` contiene la extensión de Chrome. Registra el host con `python3 server.py install-chrome-host EXTENSION_ID`; la extensión se conecta sola y se reconecta automáticamente cada 30 segundos si se cae (un clic en el icono reintenta al instante). El servidor MCP reenvía las solicitudes mediante un socket Unix local con permisos restringidos. La automatización del navegador es independiente de los controles de escritorio X11. Las pestañas propias se crean en segundo plano; la extensión deja de actuar cuando detecta que el usuario seleccionó una pestaña. Chrome no puede hacer atómicas la comprobación de actividad y la eliminación de la pestaña, así que una selección que coincida con la eliminación todavía podría cerrarse.
 
 ### Pruebas
 
@@ -284,7 +284,7 @@ Funcionam `doctor`, `list_windows`, `restore_window`, `screenshot`, `left_click`
 
 ### Estado da extensão do Chrome
 
-A pasta `extension/` contém a extensão do Chrome. Registre o host com `python3 server.py install-chrome-host EXTENSION_ID` e clique no ícone da extensão para conectar. O servidor MCP encaminha as solicitações por um socket Unix local com permissões restritas. A automação do navegador é independente dos controles de desktop X11. As abas próprias são abertas em segundo plano; a extensão para de agir quando detecta que o usuário selecionou uma aba. O Chrome não torna atômicas a verificação de atividade e a remoção da aba, então uma seleção simultânea à remoção ainda pode resultar no fechamento.
+A pasta `extension/` contém a extensão do Chrome. Registre o host com `python3 server.py install-chrome-host EXTENSION_ID`; a extensão se conecta sozinha e reconecta automaticamente a cada 30 segundos se cair (um clique no ícone tenta de novo na hora). O servidor MCP encaminha as solicitações por um socket Unix local com permissões restritas. A automação do navegador é independente dos controles de desktop X11. As abas próprias são abertas em segundo plano; a extensão para de agir quando detecta que o usuário selecionou uma aba. O Chrome não torna atômicas a verificação de atividade e a remoção da aba, então uma seleção simultânea à remoção ainda pode resultar no fechamento.
 
 ### Testes
 

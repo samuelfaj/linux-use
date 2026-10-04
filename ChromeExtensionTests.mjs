@@ -22,6 +22,10 @@ const removed = makeEvent();
 const installed = makeEvent();
 let connection;
 const noopEvent = makeEvent();
+const clicked = makeEvent();
+const alarmEvent = makeEvent();
+let connectCount = 0;
+let disconnectCalls = 0;
 
 globalThis.chrome = {
   runtime: {
@@ -29,11 +33,13 @@ globalThis.chrome = {
     onInstalled: installed,
     onStartup: noopEvent,
     connectNative() {
-      connection = {onMessage: makeEvent(), onDisconnect: makeEvent(), postMessage() {}, disconnect() { this.onDisconnect.fire(); }};
+      connectCount++;
+      connection = {onMessage: makeEvent(), onDisconnect: makeEvent(), postMessage() {}, disconnect() { disconnectCalls++; this.onDisconnect.fire(); }};
       return connection;
     },
   },
-  action: {onClicked: noopEvent, setBadgeText() {}, setTitle() {}},
+  alarms: {create() {}, onAlarm: alarmEvent},
+  action: {onClicked: clicked, setBadgeText() {}, setTitle() {}},
   tabs: {
     onActivated: activated,
     onRemoved: removed,
@@ -210,4 +216,20 @@ test('activation while a snapshot is in flight prevents the result from being re
   await assert.rejects(handleRequest({operation: 'browser_snapshot', session}), /human_activity/);
   activateOnScript = false;
   await handleRequest({operation: 'browser_close', session});
+});
+
+test('alarm reconnects after a quick disconnect and a click while connected does not disconnect', () => {
+  if (!connectCount) throw new Error('expected connect at import');
+  const before = connection;
+  const countBefore = connectCount;
+  connection.onDisconnect.fire();
+  alarmEvent.fire({name: 'other'});
+  assert.equal(connectCount, countBefore);
+  alarmEvent.fire({name: 'keep-connected'});
+  assert.equal(connectCount, countBefore + 1);
+  assert.notEqual(connection, before);
+  const disconnectsBefore = disconnectCalls;
+  clicked.fire();
+  assert.equal(disconnectCalls, disconnectsBefore);
+  assert.equal(connectCount, countBefore + 1);
 });
