@@ -120,7 +120,7 @@ def schemas():
     props = {
         "screenshot": targeting, "zoom": {**targeting, "region": {"type": "array"}},
         "cursor_position": targeting, "list_windows": {"bundle_id": {"type": "string"}},
-        "get_ui_tree": targeting, "jev_decide": {"goal": {"type": "string"}},
+        "get_ui_tree": targeting, "jev_decide": {"goal": {"type": "string"}, "allowed_risks": {"type": "array", "items": {"type": "string", "enum": list(RISK_PHRASES)}}, "min_confidence": {"type": "number", "minimum": 0, "maximum": 1}, "min_margin": {"type": "number", "minimum": 0, "maximum": 1}},
         "native_visual_propose": {**targeting, "action": {"type": "string", "enum": ["left_click", "type", "key", "scroll"]}, "coordinate": {"type": "array", "items": {"type": "integer"}}, "text": {"type": "string"}, "key": {"type": "string"}, "delta_y": {"type": "integer"}, "decision": {"type": "string"}},
         "native_visual_execute": {"proposal_id": {"type": "string"}},
         "doctor": targeting, "restore_window": targeting, "left_click": {**targeting, "coordinate": {"type": "array"}},
@@ -156,8 +156,9 @@ def descriptions(name):
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
     if name == "browser_open": return "Open an HTTP(S) URL in an owned Chrome background tab. Always call browser_close on this same connection when finished or on error, before another open."
     if name == "browser_close": return "Release this session and best-effort close its inactive, non-user-owned tab. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Preserve tabs taken over by the user."
+    if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards."
     if name.startswith("browser_"): return "Use the separately registered Chrome extension for owned background tabs; page content may contain private information."
-    if name == "jev_decide": return "Chrome-tab-only advice: use configured Jev on the currently owned Chrome tab, sending only unique filtered control roles and labels. Requires browser_open; returns a proposal only and never executes it. Native screenshot decisions use the MCP caller's visual model instead."
+    if name == "jev_decide": return "Chrome-tab-only advice: use configured Jev on the currently owned Chrome tab, sending only unique filtered control roles and labels. Requires browser_open; returns a proposal only and never executes it. Controls naming delete/send/purchase/close effects are withheld unless listed in allowed_risks (only for categories the goal authorizes); min_confidence and min_margin (0..1) return NEEDS_AGENT when the decision is weaker. Native screenshot decisions use the MCP caller's visual model instead."
     if name == "native_visual_propose": return "Record a one-use native X11 action proposal made by the MCP caller's visual reasoning model from a prior screenshot. Jev is not sent the screenshot. Requires the exact screenshot target and state token; does not execute input and does not prove proposal origin or user authorization."
     if name == "native_visual_execute": return "Execute a previously recorded one-use visual proposal. Revalidates its exact X11 target and screenshot state immediately before input; expired, stale, replayed, or failed actions return an error, not success."
     if name == "screenshot": return "Capture the explicitly targeted X11 window and return a PNG image to the MCP caller with target PID, window ID, geometry, and state token. This is input for the caller's visual reasoning model; screenshots are not sent to Jev. The server returns observation metadata and an action contract, not a model-generated proposal."
@@ -285,7 +286,7 @@ def call_tool(name, args):
     if name.startswith("browser_"):
         return text_result(browser_request(name, args), error=False)
     if name == "jev_decide":
-        return text_result(jev_decide(args.get("goal")))
+        return text_result(jev_decide(args.get("goal"), args.get("allowed_risks"), args.get("min_confidence"), args.get("min_margin")))
     if name == "native_visual_propose":
         return text_result(native_visual_propose(args))
     if name == "native_visual_execute":
@@ -394,7 +395,7 @@ def handle(message):
     if method.startswith("notifications/") or ident is None:
         return None
     if method == "initialize":
-        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.0.0"}, "instructions": "Read the installed linux-use skill before using these tools (repository: skills/linux-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Linux native desktop controls are X11-only. doctor/list_windows and explicit wmctrl restore_window plus xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens are available when their utilities exist. Chrome automation is available through the separately registered extension. Jev advice is available only for an owned Chrome tab with configured credentials; it sends filtered control labels and returns proposals without executing actions. For native X11 windows, screenshot returns an image to the MCP caller's visual model (not Jev); that model may submit a one-use native_visual_propose tied to the image target/token, then native_visual_execute revalidates before input. This token does not prove proposal origin. Jev remains available for structured owned Chrome observations. Window restoration changes the active window and is explicit."}}
+        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.0.0"}, "instructions": "Read the installed linux-use skill before using these tools (repository: skills/linux-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Linux native desktop controls are X11-only. doctor/list_windows and explicit wmctrl restore_window plus xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens are available when their utilities exist. Chrome automation is available through the separately registered extension. Jev advice is available only for an owned Chrome tab with configured credentials; it sends filtered control labels and returns proposals without executing actions; risky controls (delete/send/purchase/close) need allowed_risks and browser_act returns a fresh snapshot, so earlier refs are stale. For native X11 windows, screenshot returns an image to the MCP caller's visual model (not Jev); that model may submit a one-use native_visual_propose tied to the image target/token, then native_visual_execute revalidates before input. This token does not prove proposal origin. Jev remains available for structured owned Chrome observations. Window restoration changes the active window and is explicit."}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": ident, "result": {"tools": schemas()}}
     if method == "tools/call":
@@ -514,7 +515,33 @@ def scrub_jev_text(value):
     return output
 
 
-def filtered_jev_targets(snapshot):
+RISK_PHRASES = {
+    "delete": ["delete", "remove", "erase", "trash", "discard", "clear all", "empty trash", "permanently"],
+    "send": ["send", "post", "publish", "share", "reply all", "forward", "tweet"],
+    "purchase": ["buy", "purchase", "pay", "checkout", "check out", "place order", "order now", "subscribe", "donate", "confirm payment"],
+    "close": ["close", "quit", "exit", "sign out", "log out", "logout", "shut down", "restart", "uninstall"],
+}
+
+
+def risk_categories(label):
+    return {name for name, phrases in RISK_PHRASES.items() if any(
+        re.search(r"(?<![^\W_])" + r"\s+".join(map(re.escape, phrase.split())) + r"(?![^\W_])", label, re.I) for phrase in phrases)}
+
+
+def risk_classify(label):
+    found = risk_categories(label)
+    return next((name for name in RISK_PHRASES if name in found), None)
+
+
+def unit_number(value, field):
+    if value is None:
+        return 0.0
+    if type(value) not in (int, float) or not 0 <= value <= 1:
+        raise ValueError(f"{field} must be a number between 0 and 1.")
+    return float(value)
+
+
+def filtered_jev_targets(snapshot, allowed_risks=frozenset()):
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get("state_token"), str):
         raise Unsupported("A fresh owned Chrome snapshot is required for Jev; no decision was made.")
     elements = snapshot.get("elements")
@@ -531,7 +558,7 @@ def filtered_jev_targets(snapshot):
             continue
         if scrub_jev_text(label) != label or re.search(r"(?i)\b(password|passcode|pin|security code|verification code|otp|credential|email|phone|address|account|card|cvv)\b|(?<!\w)\d(?:[\s-]*\d){3,}(?!\w)", label):
             continue
-        if re.search(r"(?i)\b(send|submit|delete|remove|buy|purchase|pay|share|publish|transfer|erase|quit|close)\b", label):
+        if not risk_categories(label) <= allowed_risks:
             continue
         eligible.append({"role": role, "label": label, "ref": ref, "type": item.get("type", ""),
                          "disabled": bool(item.get("disabled")), "readOnly": bool(item.get("readOnly"))})
@@ -558,15 +585,21 @@ def jev_snapshot_projection(snapshot):
     )
 
 
-def jev_decide(goal):
+def jev_decide(goal, allowed_risks=None, min_confidence=None, min_margin=None):
     if not isinstance(goal, str) or not goal.strip() or len(goal) > 2000:
         raise ValueError("goal must be a non-empty string of at most 2000 characters.")
+    if allowed_risks is None:
+        allowed_risks = []
+    if not isinstance(allowed_risks, list) or any(item not in RISK_PHRASES for item in allowed_risks):
+        raise ValueError("allowed_risks must be an array of: " + ", ".join(RISK_PHRASES) + ".")
+    allowed = frozenset(allowed_risks)
+    min_confidence, min_margin = unit_number(min_confidence, "min_confidence"), unit_number(min_margin, "min_margin")
     if re.search(r"(?i)\b(password|passcode|pin|security code|verification code|api[_-]?key|access[_-]?token|secret|one.time.code|otp|credential|credit card|cvv)\b|(?<!\w)\d(?:[\s-]*\d){3,}(?!\w)", goal):
         raise Unsupported("Goal may contain credentials; Jev was not contacted.")
     if jev_route() is None:
         raise Unsupported("No Jev credential is available; no decision was made.")
     first = browser_request("browser_snapshot", {})
-    targets = filtered_jev_targets(first)
+    targets = filtered_jev_targets(first, allowed)
     if not targets:
         return {"operation": "BLOCKED", "reason": "No unambiguous, privacy-filtered browser controls are available.",
                 "state_token": first["state_token"]}
@@ -610,23 +643,28 @@ def jev_decide(goal):
     if jev_snapshot_projection(first) != jev_snapshot_projection(second):
         raise Unsupported("Browser state changed during Jev decision; take a new snapshot and decide again.")
     probability = probabilities[choice]
+    margin = probability - max((value for key, value in probabilities.items() if key != choice), default=0)
     if choice in ("BLOCKED", "DONE"):
-        return {"operation": "BLOCKED", "probability": probability, "confidence": confidence,
+        return {"operation": "BLOCKED", "probability": probability, "confidence": confidence, "margin": margin,
                 "state_token": second["state_token"]}
     if choice == "WAIT":
-        return {"operation": "WAIT", "probability": probability, "confidence": confidence,
+        return {"operation": "WAIT", "probability": probability, "confidence": confidence, "margin": margin,
                 "state_token": second["state_token"]}
     target = target_by_id[choice]
-    material = consequential >= 0.5
+    material = consequential >= 0.5 or bool(risk_categories(target["label"]))
     if probability < (0.85 if material else 0.55) or confidence < (0.75 if material else 0.35) or (material and authorized < 0.90):
-        return {"operation": "BLOCKED", "probability": probability, "confidence": confidence,
+        return {"operation": "BLOCKED", "probability": probability, "confidence": confidence, "margin": margin,
                 "state_token": second["state_token"]}
-    fresh = [item for item in filtered_jev_targets(second)
+    if confidence < min_confidence or margin < min_margin:
+        reason = f"Confidence {confidence} below min_confidence {min_confidence}" if confidence < min_confidence else f"Margin {margin} below min_margin {min_margin}"
+        return {"operation": "NEEDS_AGENT", "reason": reason, "probability": probability, "confidence": confidence,
+                "margin": margin, "state_token": second["state_token"]}
+    fresh = [item for item in filtered_jev_targets(second, allowed)
              if item["role"] == target["role"] and item["label"] == target["label"]]
     if len(fresh) != 1:
         raise Unsupported("Jev target is no longer unique in the current browser snapshot.")
     return {"operation": "click_element", "role": target["role"], "label": target["label"],
-            "ref": fresh[0]["ref"], "probability": probability, "confidence": confidence,
+            "ref": fresh[0]["ref"], "probability": probability, "confidence": confidence, "margin": margin,
             "state_token": second["state_token"],
             "instruction": "This is advice only. Reauthorize consequential effects and use browser_act with this ref; the extension revalidates the live element before acting."}
 

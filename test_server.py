@@ -166,6 +166,69 @@ class MCPTests(unittest.TestCase):
             result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
         self.assertEqual(result["operation"], "BLOCKED")
 
+    def test_risk_classify_uses_whole_words_and_phrases(self):
+        self.assertEqual(server.risk_classify("Empty   Trash"), "delete")
+        self.assertIsNone(server.risk_classify("Closet"))
+        self.assertEqual(server.risk_classify("Sign out"), "close")
+        self.assertEqual(server.risk_categories("Remove and send"), {"delete", "send"})
+
+    def test_jev_withholds_risky_controls_unless_allowed(self):
+        def decide(allowed):
+            first = self.browser_snapshot("token-1", "ref-1", label="Delete draft")
+            second = self.browser_snapshot("token-2", "ref-2", label="Delete draft")
+            args = {"goal": "Delete the draft"} | ({"allowed_risks": allowed} if allowed is not None else {})
+            response = self.jev_response("e0")
+            response["answers"]["consequential"]["noul"] = 0.9
+            response["answers"]["authorized"]["noul"] = 0.95
+            with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
+                server, "browser_request", side_effect=[first, second]
+            ), patch.object(server, "jev_evaluate", return_value=response) as evaluate:
+                return json.loads(server.call_tool("jev_decide", args)["content"][0]["text"]), evaluate
+        for allowed in (None, ["send"]):
+            result, evaluate = decide(allowed)
+            self.assertEqual(result["operation"], "BLOCKED")
+            evaluate.assert_not_called()
+        result, evaluate = decide(["delete"])
+        self.assertEqual(result["operation"], "click_element")
+        self.assertEqual(result["ref"], "ref-2")
+
+    def test_jev_risky_target_is_material_even_when_model_says_routine(self):
+        first = self.browser_snapshot("token-1", "ref-1", label="Sign out")
+        second = self.browser_snapshot("token-2", "ref-2", label="Sign out")
+        with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
+            server, "browser_request", side_effect=[first, second]
+        ), patch.object(server, "jev_evaluate", return_value=self.jev_response("e0")):
+            result = json.loads(server.call_tool("jev_decide", {"goal": "Sign out", "allowed_risks": ["close"]})["content"][0]["text"])
+        self.assertEqual(result["operation"], "BLOCKED")
+
+    def test_jev_margin_and_confidence_gates_return_needs_agent(self):
+        def decide(**gates):
+            first = self.browser_snapshot("token-1", "ref-1")
+            second = self.browser_snapshot("token-2", "ref-2")
+            response = self.jev_response("e0")
+            response["answers"]["next"]["probabilities"] = {"e0": 0.6, "WAIT": 0.4, "BLOCKED": 0.0, "DONE": 0.0}
+            with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
+                server, "browser_request", side_effect=[first, second]
+            ), patch.object(server, "jev_evaluate", return_value=response):
+                return json.loads(server.call_tool("jev_decide", {"goal": "Open settings", **gates})["content"][0]["text"])
+        result = decide()
+        self.assertEqual(result["operation"], "click_element")
+        self.assertAlmostEqual(result["margin"], 0.2)
+        result = decide(min_margin=0.5)
+        self.assertEqual(result["operation"], "NEEDS_AGENT")
+        self.assertIn("min_margin", result["reason"])
+        result = decide(min_confidence=0.99)
+        self.assertEqual(result["operation"], "NEEDS_AGENT")
+        self.assertIn("min_confidence", result["reason"])
+
+    def test_jev_rejects_invalid_risk_and_threshold_arguments(self):
+        with patch.object(server, "browser_request") as browser:
+            for field, value in (("allowed_risks", ["nuke"]), ("allowed_risks", "delete"), ("min_confidence", True),
+                                 ("min_margin", 1.5), ("min_margin", "0.5")):
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, field):
+                    server.call_tool("jev_decide", {"goal": "Open settings", field: value})
+            browser.assert_not_called()
+
     def test_doctor_and_unknown_method(self):
         with patch.object(server, "x11_available", return_value=True), patch.object(
             server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"
