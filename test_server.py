@@ -17,6 +17,17 @@ class MCPTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
+        which = server.shutil.which
+        idle_check = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
+        idle_check.start()
+        self.addCleanup(idle_check.stop)
+        config_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(config_dir.cleanup)
+        config_path = Path(config_dir.name) / "config.json"
+        config_path.write_text(json.dumps({"allow_without_activity_check": True}))
+        config_patch = patch.object(server.cua_native, "CONFIG_PATH", config_path)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
 
     def test_initialize_and_tools_contract(self):
         init = server.handle({"jsonrpc":"2.0", "id":1, "method":"initialize"})
@@ -524,6 +535,530 @@ class MCPTests(unittest.TestCase):
             windows = server.list_windows()
         self.assertEqual(windows[0]["window_id"], 0x01234567)
         self.assertEqual(windows[0]["title"], "Editor - document.txt")
+
+
+class NativePortTests(unittest.TestCase):
+    window = MCPTests.window
+
+    def setUp(self):
+        self.native = server.cua_native
+        self.native.SESSION.update(session=None, capture_scope="desktop")
+        self.native.RECORDING.clear()
+        self.native.RECORDING.update(active=False, output_dir=None, turn=0, video=False)
+        self.native.CURSOR.update(enabled=False, x=0, y=0, theme="default", motion="instant")
+        self.native.DISPATCH_DEPTH = 0
+        self.native.VIDEO = None
+        environment = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        which = server.shutil.which
+        utilities = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
+        utilities.start()
+        self.addCleanup(utilities.stop)
+        config_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(config_dir.cleanup)
+        config_path = Path(config_dir.name) / "config.json"
+        config_path.write_text(json.dumps({"allow_without_activity_check": True}))
+        config_patch = patch.object(server.cua_native, "CONFIG_PATH", config_path)
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
+        self.addCleanup(self.native.RECORDING.update, active=False)
+
+    def value(self, name, args=None):
+        return json.loads(server.call_tool(name, args or {})["content"][0]["text"])
+
+    def test_every_native_tool_has_schema_and_description(self):
+        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value".split())
+        catalog = {tool["name"]: tool for tool in server.schemas()}
+        self.assertEqual(names, set(self.native.PROPERTIES))
+        self.assertEqual(len(server.BASE_TOOLS), len(set(server.BASE_TOOLS)))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(catalog[name]["inputSchema"], self.native.schema(name))
+                self.assertFalse(catalog[name]["inputSchema"]["additionalProperties"])
+                self.assertIn("session", catalog[name]["inputSchema"]["properties"])
+                self.assertNotIn("Not implemented", catalog[name]["description"])
+        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.0")
+
+    def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
+        for name in self.native.PROPERTIES:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                server.call_tool(name, {"unrecognized": True})
+        for name, args in (("click", {"x": True, "y": 1}),
+                           ("click", {"x": 1, "y": 1, "delivery_mode": "guess"}),
+                           ("click", {"x": 1, "y": 1, "button": "unknown"}),
+                           ("click", {"x": 1, "y": 1, "count": 0}),
+                           ("click", {"x": 1, "y": 1, "modifier": [1]}),
+                           ("set_config", {"max_image_dimension": 0}),
+                           ("set_config", {"max_image_dimension": 16385}),
+                           ("type_text", {"text": "bad\x00text"}),
+                           ("launch_app", {"urls": "not-array"}),
+                           ("verify_state", {"expect": {"unknown": True}})):
+            with self.subTest(name=name, args=args), self.assertRaises(ValueError):
+                server.call_tool(name, args)
+
+    def test_click_background_uses_window_send_event_without_focus(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
+            result = self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
+        self.assertTrue(result["ok"])
+        self.assertEqual([call.args for call in run.call_args_list], [
+            ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
+            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
+
+    def test_click_foreground_activates_clicks_and_restores(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
+            self.value("double_click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
+        calls = [call.args for call in run.call_args_list]
+        self.assertEqual(calls[0], ("xdotool", "getactivewindow"))
+        self.assertEqual(calls[1], ("wmctrl", "-ia", "0x1234"))
+        self.assertIn(("xdotool", "click", "--repeat", "2", "--delay", "100", "1"), calls)
+        self.assertEqual(calls[-1], ("wmctrl", "-ia", "0x63"))
+
+    def test_foreground_restores_focus_on_input_failure(self):
+        def cli(*args):
+            if args[1] == "getactivewindow":
+                return "99"
+            if args[1] == "click":
+                raise server.Unsupported("input failed")
+            return ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
+            with self.assertRaisesRegex(server.Unsupported, "input failed"):
+                self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
+            self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+
+    def test_click_bounds_and_empty_key_validation_prevent_input(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run:
+            for name, args in (("click", {"x": 800, "y": 1}), ("drag", {"from_x": 0, "from_y": 0, "to_x": -1, "to_y": 0}),
+                               ("hotkey", {"keys": []}), ("press_key", {"key": "--window"}), ("type_text", {"text": ""})):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    self.value(name, {"window_id": 0x1234, **args})
+            run.assert_not_called()
+
+    def test_keyboard_background_and_foreground_arguments(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
+            self.value("type_text", {"window_id": 0x1234, "text": "hello"})
+            self.assertEqual(run.call_args.args, ("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello"))
+            self.value("hotkey", {"window_id": 0x1234, "keys": ["ctrl", "c"]})
+            self.assertEqual(run.call_args.args, ("xdotool", "key", "--window", "0x1234", "ctrl+c"))
+            run.reset_mock()
+            self.value("type_text", {"window_id": 0x1234, "text": "hello", "delivery_mode": "foreground"})
+            self.assertIn(("xdotool", "type", "--clearmodifiers", "--", "hello"), [call.args for call in run.call_args_list])
+            self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+
+    def test_right_click_and_modifier_cleanup(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run:
+            self.value("right_click", {"window_id": 0x1234, "x": 0, "y": 0, "modifier": ["shift"]})
+        calls = [call.args for call in run.call_args_list]
+        self.assertEqual(calls[0], ("xdotool", "keydown", "--window", "0x1234", "shift"))
+        self.assertEqual(calls[-2][-1], "3")
+        self.assertEqual(calls[-1], ("xdotool", "keyup", "--window", "0x1234", "shift"))
+
+    def test_recording_creates_evidence_before_and_after_each_mutation(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+            self.value("start_recording", {"output_dir": directory})
+            self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
+            turn = Path(directory) / "turn-00001"
+            self.assertEqual((turn / "before.png").read_bytes(), b"before")
+            self.assertEqual((turn / "after.png").read_bytes(), b"after")
+            self.assertEqual(json.loads((turn / "action.json").read_text())["name"], "click")
+            self.assertTrue(json.loads((turn / "evidence.json").read_text())["ok"])
+            self.assertFalse(self.value("stop_recording")["active"])
+            with self.assertRaisesRegex(ValueError, "already contains"):
+                self.value("start_recording", {"output_dir": directory})
+
+    def test_recording_recursively_redacts_action_arguments(self):
+        arguments = {"text": "private", "nested": [{key: "private" for key in
+                     ("value", "secret_inputs", "prompt_text", "javascript")}], "safe": "keep"}
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"):
+            self.value("start_recording", {"output_dir": directory})
+            self.native.call(server, lambda name, args: server.text_result({"ok": True}), "browser_act", arguments)
+            action = json.loads((Path(directory) / "turn-00001/action.json").read_text())
+            self.assertEqual(action["arguments"], {"text": "[REDACTED]", "nested": [{key: "[REDACTED]" for key in
+                             ("value", "secret_inputs", "prompt_text", "javascript")}], "safe": "keep"})
+            self.assertEqual(arguments["text"], "private")
+
+    def test_window_recording_never_falls_back_to_desktop(self):
+        for arguments in ({}, {"window_id": 999}):
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory, patch.object(
+                self.native, "root_png"
+            ) as root, patch.object(self.native, "target", side_effect=server.Unsupported("missing window")):
+                self.native.SESSION["capture_scope"] = "window"
+                self.value("start_recording", {"output_dir": directory})
+                self.native.call(server, lambda name, args: server.text_result({"ok": True}), "browser_act", arguments)
+                turn = Path(directory) / "turn-00001"
+                self.assertEqual(json.loads((turn / "evidence.json").read_text())["skipped"], "window_scope_without_target")
+                self.assertFalse((turn / "before.png").exists())
+                self.assertFalse((turn / "after.png").exists())
+                root.assert_not_called()
+                self.value("stop_recording")
+        with patch.object(server, "screenshot_png", return_value=b"window") as screenshot, patch.object(
+            self.native, "target", return_value=self.window
+        ), patch.object(self.native, "root_png") as root:
+            self.assertEqual(self.native.recording_png(server, {"window_id": self.window["window_id"]}), b"window")
+            screenshot.assert_called_once_with(self.window["window_id"])
+            root.assert_not_called()
+
+    def test_missing_activity_check_fails_closed_unless_config_allows(self):
+        self.native.CONFIG_PATH.write_text("{}")
+        self.assertFalse(self.value("get_config")["allow_without_activity_check"])
+        with patch.object(server, "run_cli") as run:
+            with self.assertRaisesRegex(server.Unsupported, "human_activity_check_unavailable: install xprintidle"):
+                self.value("clipboard_write", {"text": "private"})
+            run.assert_not_called()
+        self.native.CONFIG_PATH.write_text(json.dumps({"allow_without_activity_check": True}))
+        self.assertTrue(self.value("set_config", {"allow_without_activity_check": True})["allow_without_activity_check"])
+        self.native.human_guard(server, {})
+        with self.assertRaises(ValueError):
+            self.value("set_config", {"allow_without_activity_check": "true"})
+
+    def test_recording_failed_action_has_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=server.Unsupported("input failed")):
+            self.value("start_recording", {"output_dir": directory})
+            with self.assertRaisesRegex(server.Unsupported, "input failed"):
+                self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
+            evidence = json.loads((Path(directory) / "turn-00001/evidence.json").read_text())
+            self.assertFalse(evidence["ok"])
+            self.assertIn("input failed", evidence["error"])
+
+    def test_recording_keeps_human_refusal_evidence_without_input(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "run_cli") as run:
+            self.value("start_recording", {"output_dir": directory})
+            with patch.object(self.native, "human_guard", side_effect=server.Unsupported("human_activity")):
+                with self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                    self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
+            evidence = json.loads((Path(directory) / "turn-00001/evidence.json").read_text())
+            self.assertFalse(evidence["ok"])
+            self.assertIn("human_activity", evidence["error"])
+            run.assert_not_called()
+
+    def test_replay_records_replayed_actions_and_stops_on_errors(self):
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as destination:
+            turn = Path(source) / "turn-00001"
+            turn.mkdir()
+            (turn / "action.json").write_text(json.dumps({"name": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}}))
+            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+                self.value("start_recording", {"output_dir": destination})
+                self.assertTrue(self.value("replay_trajectory", {"dir": source, "delay_ms": 0})["ok"])
+                self.assertTrue((Path(destination) / "turn-00001/action.json").exists())
+            self.native.RECORDING["active"] = False
+            with patch.object(server, "list_windows", return_value=[]):
+                result = self.value("replay_trajectory", {"dir": source})
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["stopped_on_error"])
+
+    def test_config_round_trip_and_invalid_values_do_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "CONFIG_PATH", Path(directory) / "config.json"), patch.object(self.native, "human_guard"):
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 1920)
+            self.value("set_config", {"max_image_dimension": 1024})
+            self.assertEqual(self.value("get_config"), {"max_image_dimension": 1024, "allow_without_activity_check": False})
+            with self.assertRaises(ValueError):
+                self.value("set_config", {"max_image_dimension": -1})
+            self.assertEqual(json.loads((Path(directory) / "config.json").read_text()), {"max_image_dimension": 1024, "allow_without_activity_check": False})
+            self.assertEqual((Path(directory) / "config.json").stat().st_mode & 0o777, 0o600)
+
+    def test_human_activity_refuses_new_and_existing_mutations(self):
+        def cli(*args):
+            if args[0] == "xprintidle":
+                return "1999"
+            if args[1] == "getmouselocation":
+                return "X=10\nY=20\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            self.fail(f"Mutation dispatched: {args}")
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "run_cli", side_effect=cli), patch.object(server, "list_windows", return_value=[self.window]):
+            for name, args in (("click", {"window_id": 0x1234, "x": 1, "y": 2}),
+                               ("kill_app", {"pid": 4321}),
+                               ("type", {"target_window_id": 0x1234, "target_pid": 4321, "text": "hello", "expected_state_token": "unused"})):
+                with self.subTest(name=name), self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                    server.call_tool(name, args)
+
+    def test_human_idle_boundary_and_other_window_allow_action(self):
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="2000") as run:
+            self.native.human_guard(server, {"window_id": 0x1234})
+            run.assert_called_once_with("xprintidle")
+        outputs = ["100", "X=10\nY=20\nWINDOW=99\n", "99"]
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=outputs):
+            self.native.human_guard(server, {"window_id": 0x1234})
+
+    def test_health_reports_missing_idle_check(self):
+        with patch.object(server.shutil, "which", return_value=None):
+            result = self.value("health_report")
+        self.assertEqual(result["human_activity_check"], "skipped: xprintidle is not installed")
+        self.assertTrue(result["x11"])
+
+    def test_window_cursor_is_overlay_only_even_without_tkinter(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run, patch.object(self.native.importlib, "import_module", side_effect=ImportError):
+            self.value("start_session", {"session": "agent"})
+            state = self.value("set_agent_cursor_enabled", {"session": "agent", "enabled": True})
+            self.assertEqual(state["status"], "overlay_unavailable")
+            state = self.value("move_cursor", {"session": "agent", "window_id": 0x1234, "x": 5, "y": 7})
+            self.assertFalse(state["physical_pointer_moved"])
+            self.assertEqual((state["x"], state["y"]), (15, 27))
+            run.assert_not_called()
+            self.assertTrue(self.value("get_session_state", {"session": "agent"})["cursor"]["enabled"])
+            self.value("end_session", {"session": "agent"})
+            self.assertIsNone(self.native.SESSION["session"])
+
+    def test_launch_uses_detached_argv_without_shell_and_reports_pid_windows(self):
+        with patch.object(self.native, "desktop_entries", return_value=[]), patch.object(server, "list_windows", side_effect=[[], [self.window]]), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.pid = 4321
+            popen.return_value.poll.return_value = None
+            result = self.value("launch_app", {"command": "editor --new", "urls": ["https://example.com"], "additional_arguments": ["--flag"]})
+        self.assertEqual(result["pid"], 4321)
+        self.assertEqual(result["windows"], [self.window])
+        self.assertEqual(popen.call_args.args[0], ["editor", "--new", "https://example.com", "--flag"])
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertNotIn("shell", popen.call_args.kwargs)
+        with patch.object(self.native, "desktop_entries", return_value=[]):
+            result = self.value("launch_app", {"command": "editor", "name": "Editor"})
+            self.assertFalse(result["ok"])
+
+    def test_desktop_exec_expands_urls_without_shell(self):
+        entry = {"desktop_id": "editor.desktop", "name": "Editor", "exec": "editor %U", "path": "/usr/share/applications/editor.desktop"}
+        self.assertEqual(self.native.application_command({"desktop_id": "editor.desktop", "urls": ["file:///tmp/a%20b"]}, [entry]), ["editor", "file:///tmp/a%20b"])
+
+    def test_window_frame_readback_and_verify_missing_window(self):
+        changed = {**self.window, "geometry": [1, 2, 300, 200]}
+        with patch.object(server, "list_windows", side_effect=[[self.window], [changed]]), patch.object(server, "run_cli") as run:
+            result = self.value("set_window_frame", {"window_id": 0x1234, "x": 1, "y": 2, "w": 300, "h": 200})
+            self.assertTrue(result["ok"])
+            run.assert_called_once_with("wmctrl", "-ir", "0x1234", "-e", "0,1,2,300,200")
+        with patch.object(server, "list_windows", return_value=[]):
+            self.assertEqual(self.value("verify_state", {"window_id": 0x1234, "expect": {"window_exists": False}})["status"], "pass")
+
+    def test_desktop_state_uses_root_xwd_and_configured_resize(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "CONFIG_PATH", Path(directory) / "config.json"), patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/convert" if name == "convert" else None), patch.object(server, "run_cli_bytes", side_effect=[b"xwd", b"png"]) as run:
+            result = server.call_tool("get_desktop_state", {})
+            self.assertEqual(result["content"][0]["type"], "image")
+            self.assertEqual(run.call_args_list[0].args, ("xwd", "-silent", "-root"))
+            self.assertIn("1920x1920>", run.call_args_list[1].args)
+
+    def test_clipboard_binary_requires_png_and_xclip(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None):
+            path = Path(directory) / "image.png"
+            path.write_bytes(b"not png")
+            with self.assertRaisesRegex(ValueError, "PNG"):
+                self.value("clipboard_write", {"image_path": str(path)})
+            path.write_bytes(b"\x89PNG\r\n\x1a\nbytes")
+            with self.assertRaisesRegex(server.Unsupported, "require xclip"):
+                self.value("clipboard_write", {"image_path": str(path)})
+
+    def test_kill_app_sends_term_then_kill_and_refuses_server_pid(self):
+        with patch.object(self.native.os, "kill") as kill, patch.object(self.native.time, "sleep"):
+            result = self.value("kill_app", {"pid": 4321})
+            self.assertEqual(kill.call_args_list[0].args, (4321, self.native.signal.SIGTERM))
+            self.assertEqual(kill.call_args.args, (4321, self.native.signal.SIGKILL))
+            self.assertFalse(result["termination_verified"])
+            with self.assertRaises(ValueError):
+                self.value("kill_app", {"pid": os.getpid()})
+        with patch.object(self.native.os, "kill", side_effect=[None, ProcessLookupError]), patch.object(self.native.time, "sleep"):
+            self.assertEqual(self.value("kill_app", {"pid": 4321})["signal"], "SIGTERM")
+
+    def test_screen_size_cursor_and_desktop_tree_parse_utilities(self):
+        with patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xdpyinfo" if name == "xdpyinfo" else None), patch.object(server, "run_cli", return_value="  dimensions: 1920x1080 pixels"):
+            self.assertEqual(self.value("get_screen_size"), {"width": 1920, "height": 1080, "scale_factor": 1})
+        with patch.object(server.shutil, "which", return_value=None), patch.object(server, "run_cli", return_value="Screen 0: minimum 8 x 8, current 1280 x 720, maximum 32767 x 32767") as run:
+            self.assertEqual(self.value("get_screen_size")["width"], 1280)
+            run.assert_called_once_with("xrandr", "--current")
+        with patch.object(server, "run_cli", return_value="X=7\nY=8\nWINDOW=4660\n"):
+            self.assertEqual(self.value("get_cursor_position"), {"x": 7, "y": 8, "window_id": 4660})
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=["_NET_CLIENT_LIST_STACKING(WINDOW): window id # 0x99, 0x1234", "4660"]):
+            result = self.value("get_accessibility_tree")
+            self.assertEqual(result["windows"][0]["stacking_order"], 1)
+            self.assertTrue(result["windows"][0]["active"])
+
+    def test_clipboard_uses_exact_text_and_uri_targets(self):
+        with patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.returncode = 0
+            self.assertEqual(self.value("clipboard_write", {"text": "hello"})["mime_type"], "text/plain;charset=utf-8")
+            self.assertEqual(popen.call_args.args[0], ["/usr/bin/xclip", "-selection", "clipboard", "-t", "text/plain;charset=utf-8", "-i"])
+            self.assertEqual(popen.return_value.communicate.call_args.args, (b"hello",))
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "a b.txt"
+                path.write_text("file")
+                self.assertEqual(self.value("clipboard_write", {"file_path": str(path)})["mime_type"], "text/uri-list")
+                self.assertEqual(popen.return_value.communicate.call_args.args, ((path.resolve().as_uri() + "\r\n").encode(),))
+
+    def test_optional_video_uses_x11grab_and_stops_owned_process(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.poll.return_value = None
+            popen.return_value.returncode = 0
+            result = self.value("start_recording", {"output_dir": directory, "record_video": True})
+            self.assertTrue(result["video"])
+            self.assertEqual(popen.call_args.args[0], ["/usr/bin/ffmpeg", "-nostdin", "-n", "-f", "x11grab", "-i", ":1", str(Path(directory).resolve() / "recording.mp4")])
+            self.value("stop_recording")
+            popen.return_value.terminate.assert_called_once()
+            popen.return_value.wait.assert_called_once_with(timeout=5)
+
+    def test_atspi_missing_fails_closed(self):
+        with patch.object(self.native.importlib, "import_module", side_effect=ImportError):
+            for name, args in (("invoke_menu", {"path": ["File", "Save"]}), ("set_value", {"value": "hello"})):
+                with self.subTest(name=name), self.assertRaisesRegex(server.Unsupported, "python gi Atspi"):
+                    self.value(name, args)
+
+
+class BrowserPortTests(unittest.TestCase):
+    window = MCPTests.window
+    @staticmethod
+    def browser_snapshot(text="private page text"):
+        return MCPTests.browser_snapshot("current-token", "current-ref", label="Save", text=text)
+
+    setUp = MCPTests.setUp
+    def test_new_browser_operations_route_exact_names(self):
+        tools = {tool["name"]: tool for tool in server.schemas()}
+        for name, arguments in {
+            "browser_navigate": {"url": "https://example.com"},
+            "browser_click": {"ref": "current"},
+            "browser_type": {"text": "hello", "mode": "keystrokes"},
+            "browser_pointer": {"action": "hover", "x": 1, "y": 2},
+            "browser_dialog": {"action": "inspect"},
+            "browser_set_input_files": {"ref": "current", "paths": ["/tmp/a"]},
+            "page": {"action": "get_text"},
+        }.items():
+            with self.subTest(name=name), patch.object(server, "browser_request", return_value={"routed": True}) as request:
+                self.assertEqual(json.loads(server.call_tool(name, arguments)["content"][0]["text"]), {"routed": True})
+                request.assert_called_once_with(name, arguments)
+                self.assertTrue(tools[name]["inputSchema"]["properties"])
+                self.assertNotIn("separately registered", tools[name]["description"])
+
+    def test_download_moves_completed_file_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server.Path, "home", return_value=Path(folder)):
+            downloads = Path(folder) / "Downloads" / "linux-use"
+            downloads.mkdir(parents=True)
+            destination = Path(folder) / "output"
+            destination.mkdir()
+            source = downloads / "download.txt"
+            source.write_text("download content")
+            args = {"ref": "current", "directory": str(destination)}
+            with patch.object(server, "browser_request", side_effect=lambda operation, arguments: {"download_path": str(source), "elements": []}) as request:
+                result = json.loads(server.call_tool("browser_download", args)["content"][0]["text"])
+                request.assert_called_once_with("browser_download", args)
+                self.assertEqual(result["path"], str((destination / source.name).resolve()))
+                self.assertNotIn("download_path", result)
+                self.assertFalse(source.exists())
+                self.assertEqual(Path(result["path"]).read_text(), "download content")
+                source.write_text("keep source")
+                with self.assertRaises(server.Unsupported):
+                    server.call_tool("browser_download", args)
+                self.assertEqual(source.read_text(), "keep source")
+                self.assertEqual(Path(result["path"]).read_text(), "download content")
+                Path(result["path"]).unlink()
+                with patch.object(server.shutil, "copyfileobj", side_effect=OSError("disk full")), self.assertRaises(server.Unsupported):
+                    server.call_tool("browser_download", args)
+                self.assertEqual(source.read_text(), "keep source")
+                self.assertFalse(Path(result["path"]).exists())
+            with patch.object(server, "browser_request") as request:
+                for directory in ["relative", str(destination / "missing")]:
+                    with self.assertRaises(ValueError):
+                        server.call_tool("browser_download", {"ref": "current", "directory": directory})
+                request.assert_not_called()
+            (destination / "download.txt").write_text("borrowed file")
+            with patch.object(server, "browser_request", return_value={"download_path": str(destination / "download.txt")}):
+                with self.assertRaises(server.Unsupported):
+                    server.call_tool("browser_download", args)
+
+    def verify_browser_criteria(self, criteria):
+        return json.loads(server.call_tool("verify_state", {"browser": True, "expect": {"criteria": criteria}})["content"][0]["text"])
+
+    def test_criteria_maps_thresholds_in_one_text_only_request(self):
+        snapshot = self.browser_snapshot()
+        snapshot["elements"] += [{"role": "input", "name": "Password", "ref": "secret", "value": "super-secret"}]
+        criteria = ["Save available", "State absent", "Uncertain", "Clearly present", "Clearly absent"]
+        answers = {f"criterion_{index}": {"noul": probability} for index, probability in enumerate([0.85, 0.15, 0.5, 1, 0])}
+        with patch.object(server, "jev_route", return_value=("key", "endpoint", "model")), patch.object(
+            server, "browser_request", return_value=snapshot
+        ) as browser, patch.object(server, "jev_evaluate", return_value={"answers": answers}) as evaluate:
+            result = self.verify_browser_criteria(criteria)
+            self.assertEqual([item["status"] for item in result["criteria"]], ["pass", "fail", "unknown", "pass", "fail"])
+            self.assertEqual(result["status"], "fail")
+            evaluate.assert_called_once()
+            payload = evaluate.call_args.args[0]
+            self.assertEqual(len(payload["questions"]), len(criteria))
+            self.assertTrue(all(question["type"] == "noul" for question in payload["questions"].values()))
+            for private in ["private field value", "super-secret", "Password", "private page text", "https://", "state_token", "image", "value"]:
+                self.assertNotIn(private, json.dumps(payload))
+            self.assertEqual(payload["state"]["evidence"], {"labels": [{"role": "button", "label": "Save"}]})
+            self.assertEqual(browser.call_count, 2)
+
+    def test_criteria_no_key_returns_filtered_evidence_without_jev(self):
+        with patch.object(server, "jev_route", return_value=None), patch.object(
+            server, "browser_request", return_value=self.browser_snapshot()
+        ), patch.object(server, "jev_evaluate") as evaluate:
+            result = self.verify_browser_criteria(["Save available"])
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["evidence"], {"labels": [{"role": "button", "label": "Save"}]})
+            evaluate.assert_not_called()
+
+    def test_criteria_invalid_bounds_rejected_before_observation(self):
+        with patch.object(server, "browser_request") as browser:
+            for criteria in [[], ["a"] * 9, ["x" * 201], [" "], [1], "not an array"]:
+                with self.subTest(criteria=criteria), self.assertRaises(ValueError):
+                    self.verify_browser_criteria(criteria)
+            browser.assert_not_called()
+
+    def test_criteria_boundary_and_unknown_or_stale_answers(self):
+        for answers in [{}, {"criterion_0": {"noul": True}}, {"criterion_0": {"noul": 2}}]:
+            with patch.object(server, "jev_route", return_value=True), patch.object(
+                server, "browser_request", return_value=self.browser_snapshot()
+            ), patch.object(server, "jev_evaluate", return_value={"answers": answers}):
+                self.assertEqual(self.verify_browser_criteria(["x" * 200] * 8)["status"], "unknown")
+        with patch.object(server, "jev_route", return_value=True), patch.object(
+            server, "browser_request", side_effect=[self.browser_snapshot(), self.browser_snapshot(text="changed")]
+        ), patch.object(server, "jev_evaluate", return_value={"answers": {"criterion_0": {"noul": 1}}}):
+            self.assertEqual(self.verify_browser_criteria(["Save available"])["status"], "unknown")
+
+    def test_native_labels_never_read_field_values_and_scrub_names(self):
+        from unittest.mock import Mock
+        def node(role, label, children=()):
+            item = Mock()
+            item.get_role_name.return_value = role
+            item.get_name.return_value = label
+            item.get_child_count.return_value = len(children)
+            item.get_child_at_index.side_effect = lambda index: children[index]
+            return item
+        field = node("entry", "private field value")
+        frame = node("frame", "Editor", [node("button", "Save"), field, node("status", "token=private-secret"),
+                                                   node("label", "Verification code: 123456"), node("label", "123456"),
+                                                   node("label", "API key"), node("label", "token")])
+        app = node("application", "Editor", [frame])
+        app.get_process_id.return_value = self.window["pid"]
+        desktop = node("desktop", "Desktop", [app])
+        atspi, gi = Mock(), Mock()
+        atspi.get_desktop.return_value = desktop
+        with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]):
+            evidence = server.cua_native.jev_window_labels(server, self.window)
+        encoded = json.dumps(evidence)
+        self.assertIn("Save", encoded)
+        self.assertNotIn("private field value", encoded)
+        self.assertNotIn("private-secret", encoded)
+        field.get_text.assert_not_called()
+        with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "jev_route", return_value=True), patch.object(
+            server, "jev_evaluate", return_value={"answers": {"criterion_0": {"noul": 0.9}}}
+        ) as evaluate:
+            server.call_tool("verify_state", {"window_id": self.window["window_id"], "expect": {"criteria": ["Save available"]}})
+            payload = json.dumps(evaluate.call_args.args[0])
+            self.assertIn("Save", payload)
+            for secret in ("Verification code", "123456", "API key", '"token"'):
+                self.assertNotIn(secret, payload)
+        self.assertEqual(server.scrub_jev_text("abc123456 123 1234"), "abc[redacted] 123 [redacted]")
+        with patch.object(server.cua_native.importlib, "import_module", side_effect=ImportError):
+            self.assertEqual(server.cua_native.jev_window_labels(server, self.window), [])
+
+    def test_native_criteria_scrubs_title_and_uses_optional_labels(self):
+        window = {**self.window, "title": "Editor token=private-key person@example.com"}
+        with patch.object(server, "list_windows", return_value=[window]), patch.object(
+            server.cua_native, "jev_window_labels", return_value=[{"role": "button", "label": "Save"}]
+        ), patch.object(server, "jev_route", return_value=True), patch.object(
+            server, "jev_evaluate", return_value={"answers": {"criterion_0": {"noul": 0.9}}}
+        ) as evaluate:
+            result = json.loads(server.call_tool("verify_state", {"window_id": window["window_id"], "expect": {"criteria": ["Save available"]}})["content"][0]["text"])
+            self.assertEqual(result["status"], "pass")
+            payload = json.dumps(evaluate.call_args.args[0])
+            self.assertNotIn("private-key", payload)
+            self.assertNotIn("person@example.com", payload)
+            self.assertIn("Save", payload)
 
 
 if __name__ == "__main__": unittest.main()
