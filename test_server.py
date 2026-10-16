@@ -928,6 +928,58 @@ class NativePortTests(unittest.TestCase):
             popen.return_value.terminate.assert_called_once()
             popen.return_value.wait.assert_called_once_with(timeout=5)
 
+    def test_atspi_set_value_verifies_delayed_write_once_and_refuses_unverified(self):
+        from unittest.mock import Mock
+        node, app, desktop, gi, atspi = [Mock() for _ in range(5)]
+        node.get_name.return_value = self.window["title"]
+        node.get_role_name.return_value = "entry"
+        node.get_child_count.return_value = 0
+        app.get_process_id.return_value = self.window["pid"]
+        app.get_child_count.return_value = 1
+        app.get_child_at_index.return_value = node
+        desktop.get_child_count.return_value = 1
+        desktop.get_child_at_index.return_value = app
+        atspi.get_desktop.return_value = desktop
+        editable = node.get_editable_text_iface.return_value
+        editable.set_text_contents.return_value = True
+        text = node.get_text_iface.return_value
+        for observed, succeeds in [(["", "hello"], True), ([""] * 15, False)]:
+            text.get_text.side_effect = observed
+            editable.set_text_contents.reset_mock()
+            with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
+                server, "list_windows", return_value=[self.window]
+            ), patch.object(server.cua_native.time, "sleep"), patch.object(server, "run_cli") as cli:
+                if succeeds:
+                    self.assertTrue(self.value("set_value", {"window_id": self.window["window_id"], "role": "entry", "value": "hello"})["ok"])
+                else:
+                    with self.assertRaisesRegex(server.Unsupported, "accepted but unverified"):
+                        self.value("set_value", {"window_id": self.window["window_id"], "role": "entry", "value": "hello"})
+                editable.set_text_contents.assert_called_once_with("hello")
+                self.assertFalse(any(c.args and c.args[0] == "xdotool" for c in cli.call_args_list))
+        value = node.get_value_iface.return_value
+        value.set_current_value.return_value = True
+        for observed, succeeds in [([0, 42], True), ([0] * 15, False)]:
+            value.get_current_value.side_effect = observed
+            value.set_current_value.reset_mock()
+            with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
+                server, "list_windows", return_value=[self.window]
+            ), patch.object(server.cua_native.time, "sleep"):
+                if succeeds:
+                    self.assertTrue(self.value("set_value", {"window_id": self.window["window_id"], "role": "entry", "value": 42})["ok"])
+                else:
+                    with self.assertRaisesRegex(server.Unsupported, "numeric write accepted but unverified"):
+                        self.value("set_value", {"window_id": self.window["window_id"], "role": "entry", "value": 42})
+                value.set_current_value.assert_called_once_with(42)
+
+    def test_human_activity_between_click_commands_stops_before_click(self):
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server.cua_native, "human_guard", side_effect=[None, None, server.Unsupported("human_activity")]
+        ), patch.object(server, "run_cli") as cli:
+            with self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                self.value("click", {"window_id": self.window["window_id"], "x": 10, "y": 20})
+            self.assertFalse(any(c.args[:2] == ("xdotool", "click") for c in cli.call_args_list))
+
+
     def test_atspi_missing_fails_closed(self):
         with patch.object(self.native.importlib, "import_module", side_effect=ImportError):
             for name, args in (("invoke_menu", {"path": ["File", "Save"]}), ("set_value", {"value": "hello"})):

@@ -400,6 +400,7 @@ def input_action(s, name, args):
             s.run_cli("xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
             held.append(modifier)
         for command in commands:
+            human_guard(s, args)
             if command[1] == "mousemove":
                 note_cursor(window, int(command[-2]), int(command[-1]))
             s.run_cli(*command)
@@ -555,10 +556,23 @@ def atspi_action(s, name, args):
             editable = node.get_editable_text_iface()
             if editable is None or not editable.set_text_contents(args["value"]):
                 raise s.Unsupported("AT-SPI target does not support editable text.")
+            text = node.get_text_iface()
+            for _ in range(15):
+                if text is not None and text.get_text(0, -1) == args["value"]:
+                    break
+                time.sleep(0.01)
+            else:
+                raise s.Unsupported("AT-SPI text write accepted but unverified; no retry was sent.")
         else:
             value = node.get_value_iface()
             if value is None or not value.set_current_value(args["value"]):
                 raise s.Unsupported("AT-SPI target does not support numeric values.")
+            for _ in range(15):
+                if value.get_current_value() == args["value"]:
+                    break
+                time.sleep(0.01)
+            else:
+                raise s.Unsupported("AT-SPI numeric write accepted but unverified; no retry was sent.")
     return {"ok": True}
 
 
