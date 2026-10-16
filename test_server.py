@@ -578,7 +578,7 @@ class NativePortTests(unittest.TestCase):
                 self.assertFalse(catalog[name]["inputSchema"]["additionalProperties"])
                 self.assertIn("session", catalog[name]["inputSchema"]["properties"])
                 self.assertNotIn("Not implemented", catalog[name]["description"])
-        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.1")
+        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.2")
 
     def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         for name in self.native.PROPERTIES:

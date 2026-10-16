@@ -614,11 +614,16 @@ def overlay_main(path):
     root = tk.Tk()
     root.overrideredirect(True)
     root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.8)
     root.configure(takefocus=False, background="#ff3355")
-    canvas = tk.Canvas(root, width=22, height=22, highlightthickness=0, background="#ff3355")
+    scale = 1.2
+    points = [(1, 1), (1, 17.5), (5, 13.7), (7.8, 20.3),
+              (10.8, 19), (8.1, 12.6), (13.3, 12.6)]
+    points = [(x * scale, y * scale) for x, y in points]
+    width, height = 24, 30
+    canvas = tk.Canvas(root, width=width, height=height, highlightthickness=0, background="#ff3355")
     canvas.pack()
-    canvas.create_text(11, 11, text="+", fill="white", font=("sans", 18))
+    arrow = canvas.create_polygon(*[coordinate for point in points for coordinate in point],
+                                  fill="#ff3355", outline="white", width=2)
     root.update_idletasks()
     # Empty X Shape input region lets pointer events pass through the overlay.
     x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
@@ -631,8 +636,32 @@ def overlay_main(path):
     shape.XShapeCombineRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
                                              ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
                                              ctypes.c_int, ctypes.c_int]
+    class XRectangle(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                    ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+
+    def arrow_spans(vertices, box_width, box_height):
+        spans = []
+        for row in range(box_height):
+            intersections = []
+            scan_y = row + 0.5
+            for index, (x1, y1) in enumerate(vertices):
+                x2, y2 = vertices[(index + 1) % len(vertices)]
+                if (y1 <= scan_y < y2) or (y2 <= scan_y < y1):
+                    intersections.append(x1 + (scan_y - y1) * (x2 - x1) / (y2 - y1))
+            if intersections:
+                left = max(0, int(min(intersections)) - 1)
+                right = min(box_width, int(max(intersections) + 1.999))
+                if right > left:
+                    spans.append((left, row, right - left, 1))
+        return spans
+
     x11.XFlush.argtypes = [ctypes.c_void_p]
     x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    rectangles = (XRectangle * len(arrow_spans(points, width, height)))(
+        *(XRectangle(*span) for span in arrow_spans(points, width, height)))
+    shape.XShapeCombineRectangles(display, root.winfo_id(), 0, 0, 0, rectangles,
+                                  len(rectangles), 0, 0)
     shape.XShapeCombineRectangles(display, root.winfo_id(), 2, 0, 0, None, 0, 0, 0)
     x11.XFlush(display)
     Path(path).with_name("ready").touch()
@@ -655,9 +684,11 @@ def overlay_main(path):
                 progress = min(1, (time.monotonic() - started[0]) * 1000 / duration)
                 x, y = [round(old + (new - old) * progress) for old, new in zip(origin, (x, y))]
             previous[:] = [x, y]
-            root.geometry(f"22x22+{max(0, x)}+{max(0, y)}")
+            root.geometry(f"{width}x{height}+{max(0, x - int(scale))}+{max(0, y - int(scale))}")
             color = {"default": "#ff3355", "dark": "#222222", "light": "#eeeeee"}.get(state["theme"], "#ff3355")
+            outline = "#222222" if state["theme"] == "light" else "white"
             canvas.configure(background=color)
+            canvas.itemconfigure(arrow, fill=color, outline=outline)
         except (OSError, ValueError, KeyError):
             pass
         root.after(30, tick)
