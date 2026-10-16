@@ -578,7 +578,7 @@ class NativePortTests(unittest.TestCase):
                 self.assertFalse(catalog[name]["inputSchema"]["additionalProperties"])
                 self.assertIn("session", catalog[name]["inputSchema"]["properties"])
                 self.assertNotIn("Not implemented", catalog[name]["description"])
-        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.0")
+        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.1")
 
     def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         for name in self.native.PROPERTIES:
@@ -597,6 +597,13 @@ class NativePortTests(unittest.TestCase):
             with self.subTest(name=name, args=args), self.assertRaises(ValueError):
                 server.call_tool(name, args)
 
+    def test_agent_cursor_is_on_by_default_so_users_see_where_the_agent_clicks(self):
+        import importlib
+        fresh = importlib.reload(importlib.import_module("cua_native"))
+        self.assertTrue(fresh.CURSOR["enabled"])
+        importlib.reload(fresh)
+        server.cua_native = self.native
+
     def test_click_background_uses_window_send_event_without_focus(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             result = self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
@@ -606,7 +613,11 @@ class NativePortTests(unittest.TestCase):
             ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
 
     def test_click_foreground_activates_clicks_and_restores(self):
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
+        def cli(*args):
+            if args[1] == "getactivewindow":
+                return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
+            return ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
             self.value("double_click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
         calls = [call.args for call in run.call_args_list]
         self.assertEqual(calls[0], ("xdotool", "getactivewindow"))
@@ -614,10 +625,33 @@ class NativePortTests(unittest.TestCase):
         self.assertIn(("xdotool", "click", "--repeat", "2", "--delay", "100", "1"), calls)
         self.assertEqual(calls[-1], ("wmctrl", "-ia", "0x63"))
 
-    def test_foreground_restores_focus_on_input_failure(self):
+    def test_foreground_ignores_windowactivate_failure_when_wmctrl_activates(self):
+        def cli(*args):
+            if args[1] == "getactivewindow":
+                return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
+            if args[1] == "windowactivate":
+                raise server.Unsupported("windowactivate failed")
+            return ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
+            self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
+        self.assertNotIn(("xdotool", "windowactivate", "0x1234"), [call.args for call in run.call_args_list])
+
+    def test_foreground_activation_failure_restores_focus(self):
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "99"
+            if args[1] == "windowactivate":
+                raise server.Unsupported("windowactivate failed")
+            return ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
+            with self.assertRaisesRegex(server.Unsupported, "foreground activation failed: target window did not become active"):
+                self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
+        self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+
+    def test_foreground_restores_focus_on_input_failure(self):
+        def cli(*args):
+            if args[1] == "getactivewindow":
+                return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
             if args[1] == "click":
                 raise server.Unsupported("input failed")
             return ""
@@ -640,7 +674,11 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(run.call_args.args, ("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello"))
             self.value("hotkey", {"window_id": 0x1234, "keys": ["ctrl", "c"]})
             self.assertEqual(run.call_args.args, ("xdotool", "key", "--window", "0x1234", "ctrl+c"))
-            run.reset_mock()
+        def cli(*args):
+            if args[1] == "getactivewindow":
+                return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
+            return ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
             self.value("type_text", {"window_id": 0x1234, "text": "hello", "delivery_mode": "foreground"})
             self.assertIn(("xdotool", "type", "--clearmodifiers", "--", "hello"), [call.args for call in run.call_args_list])
             self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))

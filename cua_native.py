@@ -17,7 +17,7 @@ import time
 
 CONFIG_PATH = Path.home() / ".linux-use/config.json"
 SESSION = {"session": None, "capture_scope": "desktop"}
-CURSOR = {"enabled": False, "theme": "default", "motion": "instant", "x": 0, "y": 0,
+CURSOR = {"enabled": True, "theme": "default", "motion": "instant", "x": 0, "y": 0,
           "scope": "window", "overlay_available": False, "theme_id": "default", "reduced_motion": "auto"}
 OVERLAY = None
 OVERLAY_DIR = None
@@ -385,7 +385,17 @@ def input_action(s, name, args):
         if foreground:
             s.run_cli("wmctrl", "-ia", wid)
             activated = True
-            s.run_cli("xdotool", "windowactivate", "--sync", wid)
+            if active_window(s) != window["window_id"]:
+                try:
+                    s.run_cli("xdotool", "windowactivate", wid)
+                except Exception:
+                    pass
+                for _ in range(10):
+                    if active_window(s) == window["window_id"]:
+                        break
+                    time.sleep(0.1)
+                else:
+                    raise s.Unsupported("foreground activation failed: target window did not become active")
         for modifier in modifiers:
             s.run_cli("xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
             held.append(modifier)
@@ -855,7 +865,7 @@ def dispatch(s, name, args):
     if name == "end_session":
         recording_stop(s)
         overlay_stop()
-        CURSOR["enabled"] = False
+        CURSOR["enabled"] = True
         SESSION.update(session=None, capture_scope="desktop")
         return dict(SESSION)
     if name == "get_session_state":
