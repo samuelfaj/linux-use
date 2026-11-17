@@ -1203,6 +1203,21 @@ class BrowserPortTests(unittest.TestCase):
             else:
                 request.assert_not_called()
 
+    def test_screenshot_of_chrome_points_at_the_browser_tools(self):
+        # Web content answers DOM refs in a background tab far better than pixel clicks in the user's
+        # Chrome window, so a caller looking at Chrome should learn the extension is there to use.
+        for name, available, expected in (("chrome", True, True), ("chrome", False, False), ("gedit", True, False)):
+            with self.subTest(name=name, available=available), patch.object(server, "process_name", return_value=name), patch.object(
+                server, "browser_bridge_available", return_value=available
+            ):
+                self.assertEqual(server.browser_tools_hint(4321) is not None, expected)
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"png"), patch.object(
+            server, "process_name", return_value="chrome"
+        ), patch.object(server, "browser_bridge_available", return_value=True):
+            content = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})["content"]
+        self.assertEqual(content[0]["type"], "image")
+        self.assertIn("browser_open", content[-1]["text"])
+
     def test_installed_extension_id_reads_what_install_host_registered(self):
         # The native host trusts only this origin and browser_status says not_installed without it,
         # so it must read exactly what install_host writes and reject anything else.

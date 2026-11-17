@@ -399,10 +399,14 @@ def _call_tool(name, args):
                         "next_step": "MCP caller visual model may submit native_visual_propose; a separate native_visual_execute call is required",
                         "decision_model": "MCP caller visual reasoning; image is not sent to Jev",
                         "provenance": "state token binds target and pixels but does not prove that a model examined the image"}}
-        return {"content": [
+        content = [
             {"type": "image", "data": base64.b64encode(image).decode("ascii"), "mimeType": "image/png"},
             {"type": "text", "text": json.dumps(metadata, sort_keys=True)},
-        ]}
+        ]
+        hint = browser_tools_hint(window["pid"])
+        if hint:
+            content.append({"type": "text", "text": hint})
+        return {"content": content}
     if name in ("left_click", "type", "key", "scroll"):
         window, _ = verified_target(args, require_token=True, verify_screenshot=True)
         wid = hex(window["window_id"])
@@ -553,6 +557,15 @@ def chrome_running():
         return any(process_name(entry.name) in CHROME_PROCESSES for entry in Path("/proc").iterdir() if entry.name.isdigit())
     except OSError:
         return False
+
+
+def browser_tools_hint(pid):
+    """A page answers DOM refs in a background tab far better than clicks in the Chrome window, so
+    say so when the caller looks at Chrome and the extension is there to use."""
+    if process_name(pid) not in CHROME_PROCESSES or not browser_bridge_available():
+        return None
+    return ("hint: the linux-use Chrome extension is connected. For web pages use browser_open and the browser_* tools "
+            "(own background tab, DOM refs); use this window only for Chrome's own controls.")
 
 
 def browser_request(operation, arguments, timeout=40):
