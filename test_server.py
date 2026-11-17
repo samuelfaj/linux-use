@@ -14,6 +14,7 @@ class MCPTests(unittest.TestCase):
     def setUp(self):
         server.NATIVE_VISUAL_PROPOSALS.clear()
         server.NATIVE_VISUAL_OBSERVATIONS.clear()
+        server.cua_native.AGENT_INPUT["at"] = float("-inf")
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -583,6 +584,7 @@ class NativePortTests(unittest.TestCase):
         self.native.CURSOR.update(enabled=False, x=0, y=0, theme="default", motion="instant")
         self.native.DISPATCH_DEPTH = 0
         self.native.VIDEO = None
+        self.native.AGENT_INPUT["at"] = float("-inf")
         environment = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         environment.start()
         self.addCleanup(environment.stop)
@@ -852,6 +854,35 @@ class NativePortTests(unittest.TestCase):
         outputs = ["100", "X=10\nY=20\nWINDOW=99\n", "99"]
         with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=outputs):
             self.native.human_guard(server, {"window_id": 0x1234})
+
+    def test_agents_own_xtest_input_is_not_taken_for_the_user(self):
+        # xdotool moves the pointer with XTest, which resets the X idle timer just as a person does,
+        # and leaves the pointer on the target: the guard before the click then refused every
+        # background click the agent made. Input this server sent is not the user's.
+        last_input = [self.native.time.monotonic() - 10]
+        def x11(*args):
+            if args[0] == "xprintidle":
+                return str(int((self.native.time.monotonic() - last_input[0]) * 1000))
+            if args[1] == "getmouselocation":
+                return "X=20\nY=40\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            if args[1] in ("mousemove", "click"):
+                last_input[0] = self.native.time.monotonic()
+            return ""
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", side_effect=x11) as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})["ok"])
+            self.assertIn(("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+                          [call.args for call in run.call_args_list])
+            # The user moved over the target after the agent's last input: that is still a person.
+            self.native.AGENT_INPUT["at"] = self.native.time.monotonic() - 1
+            last_input[0] = self.native.time.monotonic()
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
+            self.assertFalse([call for call in run.call_args_list if call.args[1:2] in (("mousemove",), ("click",))])
 
     def test_health_reports_missing_idle_check(self):
         with patch.object(server.shutil, "which", return_value=None):

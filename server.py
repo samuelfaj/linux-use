@@ -407,7 +407,7 @@ def _call_tool(name, args):
             command = ["xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y)]
             verified_target(args, require_token=True, verify_screenshot=True)
             cua_native.note_cursor(window, x, y)
-            run_cli(*command)
+            cua_native.inject(sys.modules[__name__], *command)
             command = ["xdotool", "click", "--window", wid, "1"]
         elif name == "type":
             value = args.get("text")
@@ -426,10 +426,10 @@ def _call_tool(name, args):
             button = "4" if delta > 0 else "5"
             verified_target(args, require_token=True, verify_screenshot=True)
             cua_native.note_cursor(window, x, y)
-            run_cli("xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y))
+            cua_native.inject(sys.modules[__name__], "xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y))
             command = ["xdotool", "click", "--window", wid, "--repeat", str(min(abs(delta), 100)), button]
         verified_target(args, require_token=True, verify_screenshot=True)
-        run_cli(*command)
+        cua_native.inject(sys.modules[__name__], *command)
         return text_result({"ok": True, "window_id": window["window_id"]})
     if name in BASE_TOOLS:
         if name in ("screenshot", "zoom", "get_ui_tree", "jev_decide", "cursor_position"):

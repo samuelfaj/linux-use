@@ -24,6 +24,11 @@ OVERLAY_DIR = None
 RECORDING = {"active": False, "output_dir": None, "turn": 0, "video": False}
 VIDEO = None
 DISPATCH_DEPTH = 0
+# When this server last sent X input. XTest input resets the X idle timer exactly as the user's own
+# does; the guard must not take the agent's pointer motion for a person.
+AGENT_INPUT = {"at": float("-inf")}
+# xdotool can exit before the X server has processed its last event.
+AGENT_INPUT_GRACE = 0.25
 
 STRING = {"type": "string"}
 INTEGER = {"type": "integer"}
@@ -188,10 +193,12 @@ def human_guard(s, args, all_windows=False):
             raise s.Unsupported("human_activity_check_unavailable: install xprintidle")
         return
     require_x11(s)
+    started = time.monotonic()
     idle = s.run_cli("xprintidle").strip()
     if not idle.isdigit():
         raise s.Unsupported("Cannot determine X11 idle time safely.")
-    if int(idle) >= 2000:
+    # The last input arrived `idle` ms ago; when that was no later than our own last injection, it was ours.
+    if int(idle) >= 2000 or started - int(idle) / 1000 <= AGENT_INPUT["at"] + AGENT_INPUT_GRACE:
         return
     pointer = s.run_cli("xdotool", "getmouselocation", "--shell")
     match = re.search(r"^WINDOW=(\d+)$", pointer, re.M)
@@ -204,6 +211,14 @@ def human_guard(s, args, all_windows=False):
     ids = {w["window_id"] for w in windows if (wid is None or w["window_id"] == wid) and (pid is None or w["pid"] == pid)}
     if all_windows or wid is None and pid is None or active in ids or int(match[1]) in ids:
         raise s.Unsupported("human_activity: recent pointer/keyboard activity on the target window; no mutation performed.")
+
+
+def inject(s, *command):
+    """Run an xdotool input command as the agent and remember when, for human_guard."""
+    try:
+        return s.run_cli(*command)
+    finally:
+        AGENT_INPUT["at"] = time.monotonic()
 
 
 def health(s):
@@ -397,13 +412,13 @@ def input_action(s, name, args):
                 else:
                     raise s.Unsupported("foreground activation failed: target window did not become active")
         for modifier in modifiers:
-            s.run_cli("xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
+            inject(s, "xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
             held.append(modifier)
         for command in commands:
             human_guard(s, args)
             if command[1] == "mousemove":
                 note_cursor(window, int(command[-2]), int(command[-1]))
-            s.run_cli(*command)
+            inject(s, *command)
             if command[1] == "mousedown":
                 dragging = True
             if command[1] == "mouseup":
@@ -411,9 +426,9 @@ def input_action(s, name, args):
     finally:
         try:
             if dragging:
-                s.run_cli("xdotool", "mouseup", *([] if foreground else ["--window", wid]), "1")
+                inject(s, "xdotool", "mouseup", *([] if foreground else ["--window", wid]), "1")
             for modifier in reversed(held):
-                s.run_cli("xdotool", "keyup", *([] if foreground else ["--window", wid]), modifier)
+                inject(s, "xdotool", "keyup", *([] if foreground else ["--window", wid]), modifier)
         finally:
             if previous is not None and activated:
                 s.run_cli("wmctrl", "-ia", hex(previous))
@@ -851,7 +866,7 @@ def dispatch(s, name, args):
             if not (0 <= x < size["width"] and 0 <= y < size["height"]):
                 raise ValueError("Coordinates are outside the desktop.")
             human_guard(s, args, all_windows=True)
-            s.run_cli("xdotool", "mousemove", "--sync", str(x), str(y))
+            inject(s, "xdotool", "mousemove", "--sync", str(x), str(y))
         CURSOR.update(x=x, y=y, scope=scope)
         return {**overlay_update(), "physical_pointer_moved": scope == "desktop"}
     if name in ("click", "double_click", "right_click", "drag", "type_text", "press_key", "hotkey"):
