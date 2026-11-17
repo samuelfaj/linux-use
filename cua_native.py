@@ -201,6 +201,30 @@ def active_window(s):
         raise s.Unsupported("Cannot determine active X11 window safely.") from exc
 
 
+def front_or_none(s):
+    try:
+        return active_window(s)
+    except s.Unsupported:
+        return None
+
+
+def user_on(s, window):
+    """Whether the user is on this window now. Escalation does not apply: focus is never taken back from them."""
+    try:
+        human_guard(s, {"window_id": window["window_id"]})
+        return False
+    except s.Unsupported:
+        return True
+
+
+def hand_front_back(s, window, previous):
+    """Reactivate `previous` only while the target still holds the front and the user is not on it."""
+    if previous is None or previous == window["window_id"] or front_or_none(s) != window["window_id"] or user_on(s, window):
+        return False
+    s.run_cli("wmctrl", "-ia", hex(previous))
+    return True
+
+
 def human_guard(s, args, all_windows=False):
     if not shutil.which("xprintidle"):
         if not get_config(s)["allow_without_activity_check"]:
@@ -428,7 +452,7 @@ def input_action(s, name, args):
     else:
         chord = keys(args["keys"] if name == "hotkey" else [*args.get("modifiers", []), args["key"]])
         commands = [["xdotool", "key", *([] if foreground else ["--window", wid]), "+".join(chord)]]
-    previous = active_window(s) if foreground else None
+    previous = active_window(s) if foreground else front_or_none(s)
     held = []
     activated = False
     dragging = False
@@ -467,9 +491,14 @@ def input_action(s, name, args):
             for modifier in reversed(held):
                 inject(s, "xdotool", "keyup", *([] if foreground else ["--window", wid]), modifier)
         finally:
-            if previous is not None and activated:
-                s.run_cli("wmctrl", "-ia", hex(previous))
-    return {"ok": True, "window_id": window["window_id"], "delivery_mode": "foreground" if foreground else "background"}
+            if activated:
+                hand_front_back(s, window, previous)
+    result = {"ok": True, "window_id": window["window_id"], "delivery_mode": "foreground" if foreground else "background"}
+    # Background input must leave the user's window in front. Pressing a control makes some apps bring
+    # themselves forward; when the target did that and the user did not go there, hand the front back.
+    if not foreground and hand_front_back(s, window, previous):
+        result.update(took_focus=True, focus_returned=front_or_none(s) == previous)
+    return result
 
 
 def clipboard(s, name, args):

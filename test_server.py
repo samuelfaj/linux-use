@@ -9,6 +9,11 @@ from unittest.mock import patch
 import server
 
 
+def sent(run, verb):
+    """The xdotool commands of one kind that a run_cli mock received."""
+    return [call.args for call in run.call_args_list if call.args[:2] == ("xdotool", verb)]
+
+
 def png(width, height, tag=b""):
     """The first bytes of a PNG of this size: enough for the server to read its IHDR."""
     return b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", width, height) + tag
@@ -506,7 +511,7 @@ class MCPTests(unittest.TestCase):
         window = {**self.window, "geometry": [0, 0, 1920, 1080]}
         with patch.object(server, "list_windows", return_value=[window]), patch.object(
             server, "screenshot_png", return_value=png(1366, 768)
-        ) as capture, patch.object(server, "run_cli") as execute:
+        ) as capture, patch.object(server, "run_cli", return_value="") as execute:
             shot = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
             seen = json.loads(shot["content"][1]["text"])
             self.assertEqual((seen["image_size"], seen["window_size"]), ([1366, 768], [1920, 1080]))
@@ -521,7 +526,7 @@ class MCPTests(unittest.TestCase):
             execute.assert_not_called()
             # The cua click takes pixels of the last screenshot too.
             server.call_tool("click", {"window_id": 0x1234, "x": 683, "y": 384})
-            self.assertEqual(execute.call_args_list[0].args[-2:], ("960", "540"))
+            self.assertEqual(sent(execute, "mousemove")[0][-2:], ("960", "540"))
             server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": 0})
             self.assertEqual(capture.call_args.args, (0x1234, 0))
             with self.assertRaises(ValueError):
@@ -769,9 +774,12 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             result = self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
         self.assertTrue(result["ok"])
+        self.assertNotIn("took_focus", result)
         self.assertEqual([call.args for call in run.call_args_list], [
+            ("xdotool", "getactivewindow"),
             ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
-            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
+            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+            ("xdotool", "getactivewindow")])
 
     def test_cua_input_takes_a_screenshot_token_until_the_frame_changes_without_recapturing(self):
         # target() recaptured the window to compare pixels, so a live window made the token stale
@@ -780,7 +788,7 @@ class NativePortTests(unittest.TestCase):
         live = [self.window]
         with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
             server, "screenshot_png"
-        ) as capture, patch.object(server, "run_cli") as run:
+        ) as capture, patch.object(server, "run_cli", return_value="") as run:
             self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})["ok"])
             capture.assert_not_called()
             live[0] = {**self.window, "geometry": [10, 20, 400, 300]}
@@ -796,16 +804,16 @@ class NativePortTests(unittest.TestCase):
         live = [big]
         with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
             server, "screenshot_png", return_value=png(800, 500)
-        ), patch.object(server, "run_cli") as run:
+        ), patch.object(server, "run_cli", return_value="") as run:
             server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
             self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
-            self.assertEqual(run.call_args_list[0].args[-2:], ("201", "101"))
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("201", "101"))
             with self.assertRaises(ValueError):
                 self.value("click", {"window_id": 0x1234, "x": 800, "y": 0})
             live[0] = {**big, "geometry": [0, 0, 1200, 900]}
             run.reset_mock()
             self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
-            self.assertEqual(run.call_args_list[0].args[-2:], ("100", "50"))
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("100", "50"))
 
     def test_click_foreground_activates_clicks_and_restores(self):
         def cli(*args):
@@ -820,6 +828,39 @@ class NativePortTests(unittest.TestCase):
         self.assertIn(("xdotool", "click", "--repeat", "2", "--delay", "100", "1"), calls)
         self.assertEqual(calls[-1], ("wmctrl", "-ia", "0x63"))
 
+    def test_focus_is_handed_back_only_while_the_target_holds_it_and_the_user_is_elsewhere(self):
+        # Background input must leave the user's window in front: some apps raise themselves when a
+        # control is pressed. Foreground delivery hands the front back afterwards. Neither may pull
+        # the user away from a window they went to themselves.
+        def run_click(delivery, after_input, user_on_target=False):
+            front = ["99"]
+            def cli(*args):
+                if args[1] == "getactivewindow":
+                    return front[0]
+                if args[:2] == ("wmctrl", "-ia"):
+                    front[0] = str(int(args[2], 16))
+                if args[1] == "click":
+                    front[0] = after_input
+                return ""
+            with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+                server, "run_cli", side_effect=cli
+            ) as run, patch.object(self.native, "user_on", return_value=user_on_target):
+                result = self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": delivery})
+            return result, ("wmctrl", "-ia", "0x63") in [call.args for call in run.call_args_list]
+        result, returned = run_click("background", after_input="4660")
+        self.assertTrue(returned)
+        self.assertEqual((result["took_focus"], result["focus_returned"]), (True, True))
+        for delivery, after_input, user_on_target, expected in (
+                ("background", "99", False, False),     # nothing moved
+                ("background", "4660", True, False),    # the user went to the target
+                ("foreground", "4660", False, True),    # temporary activation is undone
+                ("foreground", "777", False, False),    # the user moved on to another window
+                ("foreground", "4660", True, False)):   # the user is on the target now
+            with self.subTest(delivery=delivery, after_input=after_input, user_on_target=user_on_target):
+                result, returned = run_click(delivery, after_input, user_on_target)
+                self.assertEqual(returned, expected)
+                self.assertNotIn("took_focus", result)
+
     def test_foreground_ignores_windowactivate_failure_when_wmctrl_activates(self):
         def cli(*args):
             if args[1] == "getactivewindow":
@@ -831,7 +872,9 @@ class NativePortTests(unittest.TestCase):
             self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
         self.assertNotIn(("xdotool", "windowactivate", "0x1234"), [call.args for call in run.call_args_list])
 
-    def test_foreground_activation_failure_restores_focus(self):
+    def test_foreground_activation_failure_leaves_focus_where_it_is(self):
+        # The target never came to the front, so there is nothing to hand back; reactivating the
+        # previous window anyway could pull the user back from wherever they went.
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "99"
@@ -841,7 +884,7 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
             with self.assertRaisesRegex(server.Unsupported, "foreground activation failed: target window did not become active"):
                 self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
-        self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+        self.assertNotIn(("wmctrl", "-ia", "0x63"), [call.args for call in run.call_args_list])
 
     def test_foreground_restores_focus_on_input_failure(self):
         def cli(*args):
@@ -866,9 +909,9 @@ class NativePortTests(unittest.TestCase):
     def test_keyboard_background_and_foreground_arguments(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             self.value("type_text", {"window_id": 0x1234, "text": "hello"})
-            self.assertEqual(run.call_args.args, ("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello"))
+            self.assertEqual(sent(run, "type"), [("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello")])
             self.value("hotkey", {"window_id": 0x1234, "keys": ["ctrl", "c"]})
-            self.assertEqual(run.call_args.args, ("xdotool", "key", "--window", "0x1234", "ctrl+c"))
+            self.assertEqual(sent(run, "key"), [("xdotool", "key", "--window", "0x1234", "ctrl+c")])
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
@@ -879,15 +922,15 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
 
     def test_right_click_and_modifier_cleanup(self):
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run:
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="") as run:
             self.value("right_click", {"window_id": 0x1234, "x": 0, "y": 0, "modifier": ["shift"]})
-        calls = [call.args for call in run.call_args_list]
+        calls = [call.args for call in run.call_args_list if call.args[1] != "getactivewindow"]
         self.assertEqual(calls[0], ("xdotool", "keydown", "--window", "0x1234", "shift"))
         self.assertEqual(calls[-2][-1], "3")
         self.assertEqual(calls[-1], ("xdotool", "keyup", "--window", "0x1234", "shift"))
 
     def test_recording_creates_evidence_before_and_after_each_mutation(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
             self.value("start_recording", {"output_dir": directory})
             self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
             turn = Path(directory) / "turn-00001"
@@ -969,7 +1012,7 @@ class NativePortTests(unittest.TestCase):
             turn = Path(source) / "turn-00001"
             turn.mkdir()
             (turn / "action.json").write_text(json.dumps({"name": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}}))
-            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
                 self.value("start_recording", {"output_dir": destination})
                 self.assertTrue(self.value("replay_trajectory", {"dir": source, "delay_ms": 0})["ok"])
                 self.assertTrue((Path(destination) / "turn-00001/action.json").exists())
@@ -1056,8 +1099,6 @@ class NativePortTests(unittest.TestCase):
             if args[1] == "getactivewindow":
                 return "4660"
             return ""
-        def sent(run, verb):
-            return [c.args for c in run.call_args_list if c.args[:2] == ("xdotool", verb)]
         def user_moves():
             # The user's last input (100 ms ago) came after anything the agent sent.
             self.native.AGENT_INPUT["at"] = float("-inf")
@@ -1244,7 +1285,7 @@ class NativePortTests(unittest.TestCase):
     def test_human_activity_between_click_commands_stops_before_click(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server.cua_native, "human_guard", side_effect=[None, None, server.Unsupported("human_activity")]
-        ), patch.object(server, "run_cli") as cli:
+        ), patch.object(server, "run_cli", return_value="") as cli:
             with self.assertRaisesRegex(server.Unsupported, "human_activity"):
                 self.value("click", {"window_id": self.window["window_id"], "x": 10, "y": 20})
             self.assertFalse(any(c.args[:2] == ("xdotool", "click") for c in cli.call_args_list))
