@@ -1033,6 +1033,18 @@ def main():
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
         if response is not None:
             sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n"); sys.stdout.flush()
+    close_browser_on_exit()
+
+
+def close_browser_on_exit():
+    """The client is gone. An agent that never reached browser_close would leave its tab open with
+    Chrome's debugging bar showing, and nothing else is listening to close it."""
+    if not browser_bridge_available():
+        return
+    try:
+        browser_request("browser_close", {})
+    except Unsupported:
+        pass
 
 if __name__ == "__main__":
     main()

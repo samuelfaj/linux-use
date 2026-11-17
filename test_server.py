@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 import fcntl
+import io
 import socket
 import tempfile
 import threading
@@ -1188,6 +1189,19 @@ class BrowserPortTests(unittest.TestCase):
             ), patch.object(server.sys, "stdin", stdin):
                 server.native_host()
                 self.assertFalse(server.BRIDGE_PATH.with_suffix(".lock").exists())
+
+    def test_client_exit_closes_the_agents_tab_only_when_the_bridge_is_up(self):
+        # An agent that never reached browser_close would leave its tab, and Chrome's debugging bar,
+        # open for good. With no bridge there is no tab to close, and exit must not wait on a reconnect.
+        for available in (True, False):
+            with self.subTest(available=available), patch.object(server, "browser_bridge_available", return_value=available), patch.object(
+                server, "browser_request", side_effect=server.Unsupported("tab already gone")
+            ) as request, patch.object(server.sys, "argv", ["server.py"]), patch.object(server.sys, "stdin", io.StringIO("")):
+                server.main()  # a failed close must not turn a clean exit into a crash
+            if available:
+                request.assert_called_once_with("browser_close", {})
+            else:
+                request.assert_not_called()
 
     def test_installed_extension_id_reads_what_install_host_registered(self):
         # The native host trusts only this origin and browser_status says not_installed without it,
