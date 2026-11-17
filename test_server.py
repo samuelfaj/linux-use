@@ -977,9 +977,10 @@ class NativePortTests(unittest.TestCase):
         atspi.get_desktop.return_value = desktop
         editable = node.get_editable_text_iface.return_value
         editable.set_text_contents.return_value = True
-        text = node.get_text_iface.return_value
+        # Readback goes through Atspi.Text.get_text(node, ...): the interface object's own get_text is the
+        # deprecated one-argument Accessible.get_text and failed every readback on real AT-SPI.
         for observed, succeeds in [(["", "hello"], True), ([""] * 15, False)]:
-            text.get_text.side_effect = observed
+            atspi.Text.get_text.side_effect = observed
             editable.set_text_contents.reset_mock()
             with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
                 server, "list_windows", return_value=[self.window]

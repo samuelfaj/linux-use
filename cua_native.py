@@ -66,7 +66,7 @@ PROPERTIES = {
     "start_recording": {"output_dir": STRING, "record_video": BOOL}, "stop_recording": {},
     "get_recording_state": {}, "replay_trajectory": {"dir": STRING, "delay_ms": {"type": "integer", "minimum": 0, "maximum": 10000}, "stop_on_error": BOOL},
     "invoke_menu": {**TARGET, "path": STRINGS},
-    "set_value": {**TARGET, "role": STRING, "label": STRING, "value": {"type": ["string", "number"]}},
+    "set_value": {**TARGET, "role": STRING, "label": STRING, "element_id": STRING, "value": {"type": ["string", "number"]}},
 }
 REQUIRED = {
     "kill_app": ["pid"], "move_cursor": ["x", "y"], "click": ["x", "y"],
@@ -98,7 +98,7 @@ DESCRIPTIONS = {
     "drag": "Window-local drag uses the physical pointer; foreground delivery restores previous focus.",
     "type_text": "Type into explicit X11 window; background uses xdotool --window, foreground restores focus.",
     "invoke_menu": "Invoke an exact enabled AT-SPI menu path; requires python gi Atspi.",
-    "set_value": "Set an unambiguous editable AT-SPI value by role/label; requires python gi Atspi.",
+    "set_value": "Set an editable AT-SPI value, chosen by element_id from get_ui_tree (with its state_token as expected_state_token) or by an unambiguous role/label; verifies by readback and never retries. Requires python gi Atspi.",
     "start_recording": "Record mutations as turn folders with action, before/after PNG and evidence; optionally capture ffmpeg X11 video.",
     "replay_trajectory": "Replay recorded mutations in order with current human-activity and argument checks; does not bypass stale tokens.",
 }
@@ -500,6 +500,29 @@ def jev_window_labels(s, window):
         return []
 
 
+def write_value(s, atspi, node, value):
+    """Write text or a number through AT-SPI and confirm it by readback; an unconfirmed write is never retried."""
+    if isinstance(value, str):
+        editable = node.get_editable_text_iface()
+        if editable is None or not editable.set_text_contents(value):
+            raise s.Unsupported("AT-SPI target does not support editable text.")
+        # Atspi.Text.get_text, not the interface object's get_text: that name resolves to the deprecated
+        # one-argument Accessible.get_text, which failed every readback after a successful write.
+        for _ in range(15):
+            if node.get_text_iface() is not None and atspi.Text.get_text(node, 0, -1) == value:
+                return
+            time.sleep(0.01)
+        raise s.Unsupported("AT-SPI text write accepted but unverified; no retry was sent.")
+    number = node.get_value_iface()
+    if number is None or not number.set_current_value(value):
+        raise s.Unsupported("AT-SPI target does not support numeric values.")
+    for _ in range(15):
+        if number.get_current_value() == value:
+            return
+        time.sleep(0.01)
+    raise s.Unsupported("AT-SPI numeric write accepted but unverified; no retry was sent.")
+
+
 def atspi_action(s, name, args):
     try:
         gi = importlib.import_module("gi")
@@ -507,6 +530,17 @@ def atspi_action(s, name, args):
         atspi = importlib.import_module("gi.repository.Atspi")
     except (ImportError, ValueError) as exc:
         raise s.Unsupported("Unsupported: invoke_menu/set_value require python gi Atspi (AT-SPI 2.0).") from exc
+    if name == "set_value" and args.get("element_id") is not None:
+        if args.get("role") or args.get("label"):
+            raise ValueError("set_value takes element_id or role/label, not both.")
+        window = s.atspi_tree.exact_window(s, {"target_pid": args.get("target_pid", args.get("pid")),
+                                               "target_window_id": args.get("target_window_id", args.get("window_id"))})
+        node = s.atspi_tree.resolve(s, window, args["element_id"], args.get("expected_state_token"))
+        if not node.get_state_set().contains(atspi.StateType.ENABLED):
+            raise s.Unsupported("AT-SPI value target is disabled.")
+        human_guard(s, args)
+        write_value(s, atspi, node, args["value"])
+        return {"ok": True, "element_id": args["element_id"]}
     window = target(s, args)
     desktop = atspi.get_desktop(0)
     applications = [desktop.get_child_at_index(i) for i in range(desktop.get_child_count())]
@@ -552,27 +586,7 @@ def atspi_action(s, name, args):
             raise s.Unsupported("AT-SPI value target is missing, ambiguous, or disabled.")
         node = matches[0]
         human_guard(s, args)
-        if isinstance(args["value"], str):
-            editable = node.get_editable_text_iface()
-            if editable is None or not editable.set_text_contents(args["value"]):
-                raise s.Unsupported("AT-SPI target does not support editable text.")
-            text = node.get_text_iface()
-            for _ in range(15):
-                if text is not None and text.get_text(0, -1) == args["value"]:
-                    break
-                time.sleep(0.01)
-            else:
-                raise s.Unsupported("AT-SPI text write accepted but unverified; no retry was sent.")
-        else:
-            value = node.get_value_iface()
-            if value is None or not value.set_current_value(args["value"]):
-                raise s.Unsupported("AT-SPI target does not support numeric values.")
-            for _ in range(15):
-                if value.get_current_value() == args["value"]:
-                    break
-                time.sleep(0.01)
-            else:
-                raise s.Unsupported("AT-SPI numeric write accepted but unverified; no retry was sent.")
+        write_value(s, atspi, node, args["value"])
     return {"ok": True}
 
 
