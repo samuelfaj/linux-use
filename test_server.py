@@ -1152,3 +1152,107 @@ class BrowserPortTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+
+class DecisionRoutingTests(unittest.TestCase):
+    """d1.2-ultra answers every decision; Jev answers only when d1.2-ultra cannot be reached."""
+
+    request = {"state": {"goal": "Click Save"}, "questions": {"q": {"type": "noul", "instructions": "?"}}}
+    answered = {"answers": {"q": {"type": "noul", "noul": 0.9}}}
+
+    def scripted(self, replies):
+        calls = []
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, limit):
+                return json.dumps(self.body).encode()[:limit]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            body = json.loads(request.data)
+            calls.append({"model": body["model"], "body": body, "timeout": timeout,
+                          "auth": request.get_header("Authorization"), "url": request.full_url})
+            reply = replies.get(body["model"], 500)
+            if isinstance(reply, BaseException):
+                raise reply
+            if isinstance(reply, int):
+                raise server.urllib.error.HTTPError(request.full_url, reply, "status", {}, None)
+            return Response(reply)
+
+        return calls, patch.object(server.urllib.request, "urlopen", side_effect=urlopen)
+
+    def test_openrouter_key_always_routes_to_d12_ultra_with_jev_fallback(self):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "ts-key"}, clear=True):
+            # The owner chose OpenRouter for every decision, so a Jev key beside it must not win.
+            self.assertEqual(server.jev_route(), ("or-key", "https://openrouter.ai/api/alpha/decisions",
+                                                  "liquid/d1.2-ultra", "typesafe/jev-1.14"))
+        with patch.dict(os.environ, {"JEV_API_KEY": "jev-key", "TYPESAFE_API_KEY": "ts-key"}, clear=True):
+            self.assertEqual(server.jev_route(), ("jev-key", "https://api.typesafe.ai/v1/systemone", "jev-latest", None))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(server.jev_route())
+
+    def test_d12_ultra_answers_and_names_the_model_that_served_it(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": dict(self.answered, model="liquid/d1.2-ultra-20261116")})
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            response = server.jev_evaluate(dict(self.request))
+        self.assertEqual(response["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertNotIn("fallback_reason", response)
+        self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra"])
+        self.assertEqual(calls[0]["auth"], "Bearer or-key")
+        # A short primary timeout leaves time for Jev when d1.2-ultra hangs.
+        self.assertEqual(calls[0]["timeout"], 5)
+
+    def test_unreachable_d12_ultra_falls_back_to_jev_and_says_why(self):
+        for failure in (503, 429, 404, TimeoutError("slow"), server.URLError(ConnectionRefusedError())):
+            with self.subTest(failure=failure):
+                calls, urlopen = self.scripted({"liquid/d1.2-ultra": failure, "typesafe/jev-1.14": self.answered})
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+                    response = server.jev_evaluate(dict(self.request))
+                self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra", "typesafe/jev-1.14"])
+                self.assertEqual(response["engine"], "typesafe/jev-1.14")
+                self.assertTrue(response["fallback_reason"].startswith("liquid/d1.2-ultra "), response["fallback_reason"])
+                self.assertEqual(response["answers"]["q"]["noul"], 0.9)
+
+    def test_rejected_request_fails_loud_instead_of_hiding_the_bug_behind_jev(self):
+        for status in (400, 401, 402, 422):
+            with self.subTest(status=status):
+                calls, urlopen = self.scripted({"liquid/d1.2-ultra": status, "typesafe/jev-1.14": self.answered})
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+                    with self.assertRaisesRegex(server.Unsupported, f"HTTP {status}"):
+                        server.jev_evaluate(dict(self.request))
+                self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra"])
+
+    def test_both_models_down_is_an_error_naming_both(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": 503, "typesafe/jev-1.14": 502})
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            with self.assertRaises(server.Unsupported) as raised:
+                server.jev_evaluate(dict(self.request))
+        self.assertIn("liquid/d1.2-ultra HTTP 503", str(raised.exception))
+        self.assertIn("typesafe/jev-1.14 HTTP 502", str(raised.exception))
+
+    def test_direct_jev_route_has_no_fallback(self):
+        calls, urlopen = self.scripted({"jev-latest": 503})
+        with patch.dict(os.environ, {"JEV_API_KEY": "jev-key"}, clear=True), urlopen:
+            with self.assertRaises(server.Unsupported):
+                server.jev_evaluate(dict(self.request))
+        self.assertEqual([(call["model"], call["timeout"]) for call in calls], [("jev-latest", 12)])
+
+    def test_image_request_keeps_its_image_on_fallback_and_gets_a_longer_timeout(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": 503, "typesafe/jev-1.14": self.answered})
+        state = server.state_with_image({"goal": "Click Save"}, "data:image/png;base64,AAAA")
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            server.jev_evaluate({"state": state, "questions": self.request["questions"]})
+        self.assertEqual(calls[0]["timeout"], 10)
+        # Jev on OpenRouter reads images up to 1024 px, so the fallback decides from the same evidence.
+        for call in calls:
+            image, text = call["body"]["state"]
+            self.assertEqual(image, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+            self.assertIn("Click Save", text)

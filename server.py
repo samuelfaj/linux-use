@@ -14,6 +14,7 @@ import socket
 import select
 import fcntl
 import uuid
+import urllib.error
 import urllib.request
 import time
 from urllib.error import URLError
@@ -589,36 +590,87 @@ def verify_criteria(criteria, *, browser=False, windows=None):
             "criteria": results, "evidence": evidence}
 
 
+PRIMARY_DECISION_MODEL = "liquid/d1.2-ultra"
+FALLBACK_DECISION_MODEL = "typesafe/jev-1.14"
+
+
 def jev_route():
-    key = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
-    if key:
-        return key, "https://api.typesafe.ai/v1/systemone", "jev-latest"
+    """OPENROUTER_API_KEY sends every decision to d1.2-ultra, with Jev on the same endpoint as fallback;
+    a Jev key alone keeps the direct TypeSafe route, which has no fallback."""
     key = os.environ.get("OPENROUTER_API_KEY")
     if key:
-        return key, "https://openrouter.ai/api/alpha/decisions", "typesafe/jev-1.13"
+        return key, "https://openrouter.ai/api/alpha/decisions", PRIMARY_DECISION_MODEL, FALLBACK_DECISION_MODEL
+    key = os.environ.get("JEV_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
+    if key:
+        return key, "https://api.typesafe.ai/v1/systemone", "jev-latest", None
     return None
+
+
+class DecisionUnreachable(Exception):
+    """The provider could not be reached; only this sends a decision to the fallback model.
+    A rejected request (400, 401, 402, 422) is a bug or an account problem and fails as is."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _decision_send(payload, key, endpoint, model, timeout):
+    body = dict(payload, model=model)
+    request = urllib.request.Request(endpoint, data=json.dumps(body).encode(), headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json"
+    }, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read(1_000_001)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 408, 429) or 500 <= exc.code <= 599:
+            raise DecisionUnreachable(f"HTTP {exc.code}") from exc
+        raise Unsupported(f"Decision request to {model} failed (HTTP {exc.code}); no action was selected.") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise DecisionUnreachable("timed out") from exc
+    except (URLError, OSError) as exc:
+        timed_out = isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout))
+        raise DecisionUnreachable("timed out" if timed_out else "unreachable") from exc
+    if len(data) > 1_000_000:
+        raise Unsupported("Decision response exceeded the size limit; no action was selected.")
+    try:
+        result = json.loads(data)
+    except (ValueError, TypeError) as exc:
+        raise Unsupported(f"{model} returned invalid JSON; no action was selected.") from exc
+    if not isinstance(result, dict):
+        raise Unsupported(f"{model} returned an invalid response; no action was selected.")
+    served = result.get("model")
+    result["engine"] = served if isinstance(served, str) and served else model
+    return result
 
 
 def jev_evaluate(payload):
     route = jev_route()
     if route is None:
-        raise Unsupported("No Jev credential is available; no decision was made.")
-    key, endpoint, model = route
-    payload["model"] = model
-    request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(), headers={
-        "Authorization": f"Bearer {key}", "Content-Type": "application/json"
-    }, method="POST")
+        raise Unsupported("No decision credential is available; no decision was made.")
+    key, endpoint, model, fallback = route
+    # A slow primary must leave time for the fallback; an image upload takes longer than text.
+    primary_timeout = (10 if isinstance(payload.get("state"), list) else 5) if fallback else 12
     try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            data = response.read(1_000_001)
-    except (OSError, URLError) as exc:
-        raise Unsupported(f"Jev request failed; no action was selected: {exc}") from exc
-    if len(data) > 1_000_000:
-        raise Unsupported("Jev response exceeded the size limit; no action was selected.")
-    try:
-        return json.loads(data)
-    except (ValueError, TypeError) as exc:
-        raise Unsupported("Jev returned invalid JSON; no action was selected.") from exc
+        return _decision_send(payload, key, endpoint, model, primary_timeout)
+    except DecisionUnreachable as first:
+        if not fallback:
+            raise Unsupported(f"Decision request failed ({first.reason}); no action was selected.") from first
+        try:
+            response = _decision_send(payload, key, endpoint, fallback, 12)
+        except DecisionUnreachable as second:
+            raise Unsupported(f"Decision request failed ({model} {first.reason}; {fallback} {second.reason}); "
+                              "no action was selected.") from second
+        response["fallback_reason"] = f"{model} {first.reason}"
+        return response
+
+
+def state_with_image(state, image):
+    """The state with the window's screenshot in front of it, as OpenRouter takes images."""
+    if not image:
+        return state
+    return [{"type": "image_url", "image_url": {"url": image}}, json.dumps(state, sort_keys=True)]
 
 
 JEV_CREDENTIAL_RE = re.compile(r"(?i)\b(password|passcode|pin|security code|verification code|api[ _-]?key|(?:access[ _-]?)?token|secret|one.time.code|otp|credential|credit card|cvv)\b|(?<!\w)\d(?:[\s-]*\d){3,}(?!\w)|\d{4,}")
