@@ -21,6 +21,7 @@ from urllib.error import URLError
 from pathlib import Path
 import atspi_tree
 import cua_native
+import subtask
 
 HOST = "io.macuse.computer_use"
 BRIDGE_PATH = Path.home() / ".local/share/linux-use/bridge.sock"
@@ -28,6 +29,7 @@ BROWSER_SESSION = str(uuid.uuid4())
 BASE_TOOLS = ["screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "restore_window", "left_click", "type", "key", "scroll", "click_element", "native_visual_propose", "native_visual_execute", "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
 BASE_TOOLS += ["browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_set_input_files", "browser_download", "page"]
 BASE_TOOLS += list(cua_native.PROPERTIES)
+BASE_TOOLS += ["run_subtask"]
 NATIVE_VISUAL_PROPOSALS = {}
 NATIVE_VISUAL_OBSERVATIONS = {}
 
@@ -141,6 +143,12 @@ def schemas():
         "scroll": {**targeting, "coordinate": {"type": "array"}, "delta_y": {"type": "integer"}},
         "click_element": {"target_pid": {"type": "integer"}, "target_window_id": {"type": "integer"},
                           "element_id": {"type": "string"}, "expected_state_token": {"type": "string"}},
+        "run_subtask": {"target_pid": {"type": "integer"}, "target_window_id": {"type": "integer"}, "goal": {"type": "string"},
+                        "verification": {"type": "array", "items": {"type": "string"}}, "constraints": {"type": "array", "items": {"type": "string"}},
+                        "inputs": {"type": "object"}, "secret_inputs": {"type": "array", "items": {"type": "string"}},
+                        "max_actions": {"type": "integer", "minimum": 1}, "allowed_risks": {"type": "array", "items": {"type": "string", "enum": list(RISK_PHRASES)}},
+                        "dry_run": {"type": "boolean"}, "min_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "min_margin": {"type": "number", "minimum": 0, "maximum": 1}, "log_path": {"type": "string"}},
         "browser_open": {"url": {"type": "string"}},
         "browser_act": {"action": {"type": "string", "enum": ["click", "fill", "type", "scroll"]}, "ref": {"type": "string"}, "text": {"type": "string"}, "delta_x": {"type": "number"}, "delta_y": {"type": "number"}},
     }
@@ -155,6 +163,7 @@ def schemas():
         "key": ["target_pid", "target_window_id", "expected_state_token", "key"],
         "scroll": ["target_pid", "target_window_id", "expected_state_token", "coordinate", "delta_y"],
         "click_element": ["target_pid", "target_window_id", "element_id"],
+        "run_subtask": ["target_pid", "target_window_id", "goal", "verification"],
         "browser_open": ["url"], "browser_act": ["action"]}
     props.update({
         "browser_navigate": {"url": {"type": "string"}},
@@ -215,6 +224,12 @@ def descriptions(name):
                                         "without moving the pointer or taking focus. Pass element_id and the read's state_token as expected_state_token. "
                                         "Waits for the window to react and reports effect: ui_changed when AT-SPI events arrived, otherwise unverified "
                                         "(not proof of no effect). A changed or removed element returns stale_state_token.")
+    if name == "run_subtask": return ("Requires OPENROUTER_API_KEY or a Jev key and python gi Atspi. Runs a bounded loop (max_actions, default 30) that reads "
+                                      "the exact window's AT-SPI tree, asks the decision model (liquid/d1.2-ultra, Jev on fallback; no screenshot) for one "
+                                      "step (CLICK, SET_VALUE, WAIT, DONE, BLOCKED or NEEDS_INPUT), acts through AT-SPI and reads again. Literal text "
+                                      "comes only from inputs; secret_inputs are typed but never sent to the model, returned or logged. Risky controls "
+                                      "(delete, send, purchase, close) are withheld unless in allowed_risks. No keyboard shortcuts on Linux. Stops with "
+                                      "SUBTASK_COMPLETE, BLOCKED, NEEDS_INPUT, NEEDS_AGENT or DRY_RUN, and on human activity.")
     if name == "jev_decide": return "Chrome-tab-only advice: use configured Jev on the currently owned Chrome tab, sending only unique filtered control roles and labels. Requires browser_open; returns a proposal only and never executes it. Controls naming delete/send/purchase/close effects are withheld unless listed in allowed_risks (only for categories the goal authorizes); min_confidence and min_margin (0..1) return NEEDS_AGENT when the decision is weaker. Native screenshot decisions use the MCP caller's visual model instead."
     if name == "native_visual_propose": return "Record a one-use native X11 action proposal made by the MCP caller's visual reasoning model from a prior screenshot. Jev is not sent the screenshot. Requires the exact screenshot target and state token; does not execute input and does not prove proposal origin or user authorization."
     if name == "native_visual_execute": return "Execute a previously recorded one-use visual proposal. Revalidates its exact X11 target and screenshot state immediately before input; expired, stale, replayed, or failed actions return an error, not success."
@@ -319,7 +334,7 @@ def _call_tool(name, args):
             supported += ["restore_window", "screenshot", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
         supported += cua_native.available_tools(sys.modules[__name__])
         if x11_available() and shutil.which("wmctrl") and cua_native.health(sys.modules[__name__])["atspi_available"]:
-            supported += ["get_ui_tree", "click_element"]
+            supported += ["get_ui_tree", "click_element"] + (["run_subtask"] if jev_route() else [])
         browser_available = browser_bridge_available()
         browser_status = None
         if browser_available:
@@ -364,6 +379,10 @@ def _call_tool(name, args):
     if name == "click_element":
         module = sys.modules[__name__]
         return text_result(atspi_tree.click_element(module, args, lambda: cua_native.human_guard(module, args)))
+    if name == "run_subtask":
+        if jev_route() is None:
+            raise Unsupported("run_subtask needs OPENROUTER_API_KEY or a Jev key; use jev_decide for LLM-driven steps.")
+        return text_result(subtask.run(sys.modules[__name__], args))
     if name == "native_visual_propose":
         return text_result(native_visual_propose(args))
     if name == "native_visual_execute":

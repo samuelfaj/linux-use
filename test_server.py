@@ -1419,3 +1419,122 @@ class AtspiTreeTests(unittest.TestCase):
         result, _ = verify(server.Unsupported("Decision request failed (unreachable)"))
         self.assertEqual(result["criteria"][0]["status"], "unknown")
         self.assertIn("unreachable", result["criteria"][0]["reason"])
+
+
+class SubtaskTests(unittest.TestCase):
+    """run_subtask: the model picks among offered ids; text only from inputs; secrets never leave."""
+
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def setUp(self):
+        server.atspi_tree.STORE.clear()
+
+    def nodes(self, *, field_value="", extra=()):
+        item = AtspiTreeTests.item
+        return [item(0, "frame", "Form"), item(1, "label", "Status: Ready", parent="ax_0"),
+                item(2, "text", "Password", parent="ax_0", value=field_value, actions=["activate"]),
+                item(3, "button", "Save", parent="ax_0", actions=["click"]), *extra]
+
+    @staticmethod
+    def answer(request, operation, target=None, input_id=None, verify=0.97, constraint=0.97, submit="NONE"):
+        questions = request["questions"]
+
+        def choice(name, selected):
+            criteria = questions[name]["criteria"]
+            others = [key for key in criteria if key != selected]
+            probabilities = {key: 0.05 / len(others) for key in others} if others else {}
+            probabilities[selected] = 0.95 if others else 1.0
+            return {"choice": selected, "probabilities": probabilities, "confidence": 0.95}
+        answers = {"operation": choice("operation", operation), "constraint_ok": {"noul": constraint}}
+        if target:
+            answers["target"] = choice("target", target)
+        if input_id:
+            answers["input"] = choice("input", input_id)
+            answers["submit"] = choice("submit", submit)
+        for name in questions:
+            if name.startswith("verify_"):
+                answers[name] = {"noul": verify}
+        return {"answers": answers, "engine": "liquid/d1.2-ultra-20261116"}
+
+    def run_task(self, task, trees, script, *, click=None, set_value=None):
+        requests = []
+
+        def evaluate(request):
+            requests.append(request)
+            return script(request, len(requests) - 1)
+        args = {"target_pid": 77, "target_window_id": 4194311, **task}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "jev_route", return_value=("key", "endpoint", "model", None)
+        ), patch.object(server.atspi_tree, "snapshot", side_effect=[("ax-t%d" % index, tree) for index, tree in enumerate(trees)]
+        ), patch.object(server, "jev_evaluate", side_effect=evaluate), patch.object(
+            server.atspi_tree, "click_element", side_effect=click or (lambda *a: {"ok": True, "effect": "ui_changed"})
+        ) as clicked, patch.object(server.cua_native, "atspi_action", side_effect=set_value or (lambda *a: {"ok": True})) as written, patch.object(
+            server.subtask.time, "sleep"
+        ):
+            result = json.loads(server.call_tool("run_subtask", args)["content"][0]["text"])
+        return result, requests, clicked, written
+
+    def test_types_a_secret_saves_and_never_leaks_the_secret(self):
+        trees = [self.nodes(), self.nodes(field_value="hunter2"), self.nodes(field_value="hunter2")]
+        script = lambda request, index: (self.answer(request, "SET_VALUE", "ax_2", "input_0") if index == 0
+                                         else self.answer(request, "CLICK", "ax_3") if index == 1 else self.answer(request, "DONE"))
+        task = {"goal": "Sign in", "inputs": {"password": "hunter2"}, "secret_inputs": ["password"], "verification": ["Signed in"]}
+        result, requests, clicked, written = self.run_task(task, trees, script)
+        self.assertEqual((result["status"], result["actions_taken"]), ("SUBTASK_COMPLETE", 2))
+        self.assertEqual(written.call_args.args[2]["value"], "hunter2")
+        self.assertEqual(written.call_args.args[2]["expected_state_token"], "ax-t0")
+        self.assertEqual(clicked.call_args.args[1]["element_id"], "ax_3")
+        # The value went into the field, yet neither the model nor the caller ever saw it.
+        self.assertNotIn("hunter2", json.dumps(requests))
+        self.assertNotIn("hunter2", json.dumps(result))
+        self.assertEqual(result["history"][0]["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertIn("Status: Ready", json.dumps(requests[0]["state"]["texts"]))
+
+    def test_risky_control_is_withheld_and_a_forged_choice_is_not_executed(self):
+        item = AtspiTreeTests.item
+        tree = self.nodes(extra=[item(4, "button", "Delete account", parent="ax_0", actions=["click"])])
+        forged = lambda request, index: self.answer(request, "CLICK", "ax_3") | {"answers": {
+            **self.answer(request, "CLICK", "ax_3")["answers"],
+            "target": {"choice": "ax_4", "probabilities": {"ax_4": 1.0}, "confidence": 1.0}}}
+        result, requests, clicked, _ = self.run_task({"goal": "Clean up", "verification": ["Done"]}, [tree], forged)
+        self.assertNotIn("Delete account", json.dumps(requests[0]))
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "invalid decision"))
+        clicked.assert_not_called()
+
+    def test_a_single_candidate_gets_none_and_choosing_it_stops_without_acting(self):
+        tree = [AtspiTreeTests.item(0, "frame", "Form"), AtspiTreeTests.item(1, "button", "Save", parent="ax_0", actions=["click"])]
+        result, requests, clicked, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [tree],
+                                                     lambda request, index: self.answer(request, "CLICK", "NONE"))
+        # d1.2-ultra rejects a one-option choice with HTTP 422; NONE also lets the model refuse the only control.
+        self.assertEqual(sorted(requests[0]["questions"]["target"]["criteria"]), ["NONE", "ax_1"])
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "model chose none of the offered elements"))
+        clicked.assert_not_called()
+
+    def test_done_needs_every_verification_criterion(self):
+        result, _, _, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [self.nodes()],
+                                        lambda request, index: self.answer(request, "DONE", verify=0.6))
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "verification criterion not met: Saved"))
+
+    def test_user_activity_stops_the_loop(self):
+        def busy(*args):
+            raise server.Unsupported("human_activity: recent pointer/keyboard activity on the target window")
+        result, _, _, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [self.nodes()],
+                                        lambda request, index: self.answer(request, "CLICK", "ax_3"), click=busy)
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "user took control"))
+
+    def test_dry_run_plans_without_acting(self):
+        result, _, clicked, written = self.run_task({"goal": "Save", "verification": ["Saved"], "dry_run": True}, [self.nodes()],
+                                                    lambda request, index: self.answer(request, "CLICK", "ax_3"))
+        self.assertEqual((result["status"], result["planned_action"]["target"]), ("DRY_RUN", "ax_3"))
+        clicked.assert_not_called()
+        written.assert_not_called()
+
+    def test_invalid_subtasks_are_refused_without_echoing_inputs(self):
+        for task, field in (({"goal": "x"}, "verification"), ({"goal": "x", "verification": ["v"], "shortcuts": {"MOD+S": "Save"}}, "shortcuts"),
+                            ({"goal": "x", "verification": ["v"], "inputs": {"pin": "9921"}, "secret_inputs": ["code"]}, "secret_inputs")):
+            with self.subTest(field=field), patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+                server, "jev_route", return_value=("key", "endpoint", "model", None)
+            ), self.assertRaises(ValueError) as raised:
+                server.call_tool("run_subtask", {"target_pid": 77, "target_window_id": 4194311, **task})
+            self.assertIn(field, str(raised.exception))
+            self.assertNotIn("9921", str(raised.exception))

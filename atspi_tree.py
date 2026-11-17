@@ -351,3 +351,14 @@ def click_element(s, args, guard):
         raise s.Unsupported(f"AT-SPI refused the {names[index]} action; no retry was sent.")
     return {"ok": True, "element_id": args["element_id"], "action": names[index], **observed,
             "hint": "Read the window again with get_ui_tree before the next element action."}
+
+
+def press(s, window, element_id, token, action_name):
+    """Run one named AT-SPI action of an element from a read, such as activate on a text field for Enter."""
+    atspi = load(s)
+    node = resolve(s, window, element_id, token)
+    names = _actions(atspi, node)
+    if action_name not in names:
+        raise s.Unsupported(f"{element_id} has no {action_name} action; no key was sent.")
+    if not atspi.Action.do_action(node, names.index(action_name)):
+        raise s.Unsupported(f"AT-SPI refused the {action_name} action; no retry was sent.")
