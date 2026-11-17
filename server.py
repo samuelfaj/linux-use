@@ -64,12 +64,42 @@ def list_windows():
     return windows
 
 
+TOKEN_PREFIX = "x11-pixel-v1:"
+
+
+def png_size(data):
+    """[width, height] from a PNG's IHDR chunk, or None when the bytes are not a PNG."""
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return list(struct.unpack(">II", data[16:24]))
+    return None
+
+
 def state_token(window, screenshot=None):
-    identity = {key: window[key] for key in ("window_id", "pid", "desktop", "geometry", "title")}
+    """The window's identity and frame and, for a screenshot, the size of the image the caller holds.
+    Pixel coordinates depend on the frame they were read from, not on what was drawn in it (a caret,
+    a clock); the pixel digest is carried for information only."""
+    envelope = {"version": 1, "target_pid": window["pid"], "target_window_id": window["window_id"],
+                "geometry": list(window["geometry"])}
     if screenshot is not None:
-        identity["screenshot_sha256"] = hashlib.sha256(screenshot).hexdigest()
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+        envelope.update(image_size=png_size(screenshot), pixels_sha256=hashlib.sha256(screenshot).hexdigest())
+    encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
+    return TOKEN_PREFIX + base64.urlsafe_b64encode(encoded).decode("ascii")
+
+
+def token_view(token, window):
+    """What a state token describes, while the window keeps the identity and frame it had then; else None."""
+    if not isinstance(token, str) or not token.startswith(TOKEN_PREFIX):
+        return None
+    try:
+        envelope = json.loads(base64.urlsafe_b64decode(token[len(TOKEN_PREFIX):]))
+    except ValueError:
+        return None
+    if not isinstance(envelope, dict) or envelope.get("version") != 1:
+        return None
+    if [envelope.get("target_pid"), envelope.get("target_window_id"), envelope.get("geometry")] != [
+            window["pid"], window["window_id"], list(window["geometry"])]:
+        return None
+    return envelope
 
 
 def verified_target(args, require_token=False, verify_screenshot=False):
@@ -85,11 +115,10 @@ def verified_target(args, require_token=False, verify_screenshot=False):
     if len(matches) != 1:
         raise Unsupported("Target window identity is missing or ambiguous; no action was performed. " + cua_native.MISSING_HINT)
     window = matches[0]
-    screenshot = screenshot_png(window["window_id"]) if verify_screenshot else None
-    token = state_token(window, screenshot)
-    if supplied is not None and supplied != token:
+    if supplied is not None and token_view(supplied, window) is None:
         raise Unsupported("Target state token is stale; refresh the target state before acting. " + cua_native.STALE_HINT)
-    return window, token
+    screenshot = screenshot_png(window["window_id"]) if verify_screenshot else None
+    return window, state_token(window, screenshot)
 
 
 def run_cli_bytes(*args, input_data=None):
@@ -375,7 +404,7 @@ def _call_tool(name, args):
             raise Unsupported("Target window changed during screenshot capture; no observation was returned.")
         token = state_token(window, image)
         supplied = args.get("expected_state_token")
-        if supplied is not None and supplied != token:
+        if supplied is not None and token_view(supplied, window) is None:
             raise Unsupported("Target screenshot state token is stale; refresh the screenshot before proposing an action. " + cua_native.STALE_HINT)
         _prune_native_visual_observations()
         if token not in NATIVE_VISUAL_OBSERVATIONS and len(NATIVE_VISUAL_OBSERVATIONS) >= 32:
@@ -398,41 +427,37 @@ def _call_tool(name, args):
             {"type": "text", "text": json.dumps(metadata, sort_keys=True)},
         ]}
     if name in ("left_click", "type", "key", "scroll"):
+        # One capture: the window must still render. The token holds while the frame is unchanged.
         window, _ = verified_target(args, require_token=True, verify_screenshot=True)
         wid = hex(window["window_id"])
-        if name == "left_click":
+        commands = []
+        if name in ("left_click", "scroll"):
             coordinate = args.get("coordinate")
             if not isinstance(coordinate, list) or len(coordinate) != 2 or any(type(v) is not int for v in coordinate):
                 raise ValueError("coordinate must be [x, y] integer window-relative coordinates.")
             x, y = coordinate
             width, height = window["geometry"][2:]
             if not (0 <= x < width and 0 <= y < height): raise ValueError("coordinate is outside the target window.")
-            command = ["xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y)]
-            verified_target(args, require_token=True, verify_screenshot=True)
-            cua_native.note_cursor(window, x, y)
-            cua_native.inject(sys.modules[__name__], *command)
-            command = ["xdotool", "click", "--window", wid, "1"]
+            commands.append(["xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y)])
+        if name == "left_click":
+            commands.append(["xdotool", "click", "--window", wid, "1"])
         elif name == "type":
             value = args.get("text")
             if not isinstance(value, str) or not value or "\x00" in value: raise ValueError("text must be a non-empty string without NUL.")
-            command = ["xdotool", "type", "--window", wid, "--clearmodifiers", "--", value]
+            commands.append(["xdotool", "type", "--window", wid, "--clearmodifiers", "--", value])
         elif name == "key":
             value = args.get("key")
             if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_+<>-]{1,64}", value): raise ValueError("key must be a valid xdotool key name.")
-            command = ["xdotool", "key", "--window", wid, value]
+            commands.append(["xdotool", "key", "--window", wid, value])
         else:
-            coordinate, delta = args.get("coordinate"), args.get("delta_y")
-            if not isinstance(coordinate, list) or len(coordinate) != 2 or any(type(v) is not int for v in coordinate): raise ValueError("coordinate must be [x, y] integer window-relative coordinates.")
-            x, y = coordinate
-            width, height = window["geometry"][2:]
-            if not (0 <= x < width and 0 <= y < height) or type(delta) is not int or delta == 0: raise ValueError("scroll requires an in-window coordinate and non-zero integer delta_y.")
-            button = "4" if delta > 0 else "5"
-            verified_target(args, require_token=True, verify_screenshot=True)
-            cua_native.note_cursor(window, x, y)
-            cua_native.inject(sys.modules[__name__], "xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y))
-            command = ["xdotool", "click", "--window", wid, "--repeat", str(min(abs(delta), 100)), button]
-        verified_target(args, require_token=True, verify_screenshot=True)
-        cua_native.inject(sys.modules[__name__], *command)
+            delta = args.get("delta_y")
+            if type(delta) is not int or delta == 0: raise ValueError("scroll requires a non-zero integer delta_y.")
+            commands.append(["xdotool", "click", "--window", wid, "--repeat", str(min(abs(delta), 100)), "4" if delta > 0 else "5"])
+        verified_target(args, require_token=True)  # the frame is still the one the token was read from
+        for command in commands:
+            if command[1] == "mousemove":
+                cua_native.note_cursor(window, int(command[-2]), int(command[-1]))
+            cua_native.inject(sys.modules[__name__], *command)
         return text_result({"ok": True, "window_id": window["window_id"]})
     if name in BASE_TOOLS:
         if name in ("screenshot", "zoom", "get_ui_tree", "jev_decide", "cursor_position"):

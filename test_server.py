@@ -383,7 +383,7 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "changed during screenshot"):
                 server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
 
-    def test_screenshot_token_can_be_reused_only_for_identical_pixels(self):
+    def test_screenshot_token_is_reproducible_and_refuses_unknown_tokens(self):
         token = server.state_token(self.window, b"same-pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server, "screenshot_png", return_value=b"same-pixels"
@@ -458,12 +458,16 @@ class MCPTests(unittest.TestCase):
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[-1]})
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[0]})
 
-    def test_native_visual_proposal_rejects_stale_pixels(self):
+    def test_native_visual_proposal_rejects_a_moved_window(self):
+        # The proposal's coordinates were read from the screenshot's frame; once the window moves
+        # they name another place, so the token is stale before any input.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
             server, "screenshot_png", side_effect=[b"old-pixels", b"new-pixels"]
         ), patch.object(server, "run_cli") as execute:
             server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            live[0] = {**self.window, "geometry": [400, 20, 800, 600]}
             with self.assertRaisesRegex(server.Unsupported, "stale"):
                 server.call_tool("native_visual_propose", {"target_pid": 4321, "target_window_id": 0x1234,
                     "expected_state_token": token, "action": "type", "text": "hello", "decision": "Type text"})
@@ -501,17 +505,31 @@ class MCPTests(unittest.TestCase):
             self.assertIn("--window", execute.call_args_list[5].args)
 
     def test_visual_change_makes_screenshot_token_stale_before_input(self):
+        # The token used to hash the pixels, so a blinking caret or a clock tick made it stale before
+        # the action arrived, and every pixel action recaptured up to three times. Coordinates depend
+        # on the frame they were read from, not on what was drawn in it: a repaint keeps the token
+        # (one capture checks the window still renders), a moved or resized window makes it stale.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"new-pixels"), patch.object(server, "run_cli") as execute:
-            with self.assertRaisesRegex(server.Unsupported, "stale"):
-                server.call_tool("left_click", {"target_pid":4321, "target_window_id":0x1234,
-                                                   "expected_state_token":token, "coordinate":[10, 20]})
-            execute.assert_not_called()
+        live = [self.window]
+        args = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "coordinate": [10, 20]}
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=b"new-pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            server.call_tool("left_click", args)
+            self.assertEqual(execute.call_args.args, ("xdotool", "click", "--window", "0x1234", "1"))
+            self.assertEqual(capture.call_count, 1)
+            for frame in ([400, 20, 800, 600], [10, 20, 640, 600]):
+                live[0] = {**self.window, "geometry": frame}
+                execute.reset_mock()
+                with self.subTest(frame=frame), self.assertRaisesRegex(server.Unsupported, "stale"):
+                    server.call_tool("left_click", args)
+                execute.assert_not_called()
 
-    def test_failed_pre_input_recapture_prevents_dispatch(self):
+    def test_failed_pre_input_capture_prevents_dispatch(self):
+        # The one capture before input proves the window still renders; without it no input is sent.
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
-            server, "screenshot_png", side_effect=[b"pixels", server.Unsupported("capture failed")]
+            server, "screenshot_png", side_effect=server.Unsupported("capture failed")
         ), patch.object(server, "run_cli") as execute:
             with self.assertRaisesRegex(server.Unsupported, "capture failed"):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":0x1234,
@@ -665,6 +683,22 @@ class NativePortTests(unittest.TestCase):
         self.assertEqual([call.args for call in run.call_args_list], [
             ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
             ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
+
+    def test_cua_input_takes_a_screenshot_token_until_the_frame_changes_without_recapturing(self):
+        # target() recaptured the window to compare pixels, so a live window made the token stale
+        # and each action paid for a capture. The frame decides, as for the pixel tools.
+        token = server.state_token(self.window, b"pixels")
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png"
+        ) as capture, patch.object(server, "run_cli") as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})["ok"])
+            capture.assert_not_called()
+            live[0] = {**self.window, "geometry": [10, 20, 400, 300]}
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "stale"):
+                self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})
+            run.assert_not_called()
 
     def test_click_foreground_activates_clicks_and_restores(self):
         def cli(*args):

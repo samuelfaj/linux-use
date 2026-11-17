@@ -185,10 +185,8 @@ def target(s, args, optional=False):
     if len(windows) != 1:
         raise s.Unsupported("Target window identity is missing or ambiguous; no action was performed. " + MISSING_HINT)
     window = windows[0]
-    if "expected_state_token" in args:
-        token = s.state_token(window, s.screenshot_png(window["window_id"]))
-        if args["expected_state_token"] not in (token, s.state_token(window)):
-            raise s.Unsupported("Target state token is stale; refresh before acting. " + STALE_HINT)
+    if "expected_state_token" in args and s.token_view(args["expected_state_token"], window) is None:
+        raise s.Unsupported("Target state token is stale; refresh before acting. " + STALE_HINT)
     return window
 
 
