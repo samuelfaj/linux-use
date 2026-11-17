@@ -174,7 +174,10 @@ def schemas():
         "browser_set_input_files": {"ref": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}},
         "browser_download": {"ref": {"type": "string"}, "directory": {"type": "string"}},
         "page": {"action": {"type": "string", "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "insert_text", "type_keystrokes"]}, "javascript": {"type": "string"}, "css_selector": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}, "attributes": {"type": "array", "items": {"type": "string"}}},
+        "browser_snapshot": {"query": {"type": "string", "description": "Case-insensitive substring of an element's role, name or value; a|b for alternatives. Returns only matching elements and leaves the page text out."}},
     })
+    for name in BROWSER_PAGE_TOOLS:
+        props[name] = {**props.get(name, {}), "allow_while_user_active": ALLOW_WHILE_USER_ACTIVE}
     required.update({
         "browser_navigate": ["url"],
         "browser_type": ["text"],
@@ -193,12 +196,21 @@ def schemas():
     return out
 
 
+# The browser tools that act on the owned tab's page. browser_dialog is left out, as in mac-use:
+# a dialog in a tab the user selected is theirs to answer.
+BROWSER_PAGE_TOOLS = ("browser_snapshot", "browser_act", "browser_navigate", "browser_click", "browser_type",
+                      "browser_pointer", "browser_set_input_files", "browser_download", "page")
+# Stealth stays the default; this is the caller's explicit escalation, for one call.
+ALLOW_WHILE_USER_ACTIVE = {"type": "boolean", "default": False,
+                           "description": "Act even though the user is using the target. Only after the non-disturbing routes failed, and never when the user said not to interrupt them."}
+
+
 BROWSER_DESCRIPTIONS = {
     "browser_navigate": "Navigate the session's owned background tab to an HTTP, HTTPS or about URL. Invalidates previous refs and returns a fresh snapshot.",
     "browser_click": "Trusted click on a snapshot ref or viewport x,y in the owned background tab. Returns a fresh snapshot.",
     "browser_type": "Type text into the owned background tab, optionally focusing a ref. insert_text inserts text; keystrokes sends key events per character. Returns a fresh snapshot.",
     "browser_pointer": "Hover, right-click, double-click, scroll or drag in the owned background tab using refs or viewport coordinates. Returns a fresh snapshot.",
-    "browser_dialog": "Inspect, accept or dismiss a JavaScript dialog. Debugger stays attached while a dialog is open, otherwise detaches after each call. Only dialogs observed while attached are tracked.",
+    "browser_dialog": "Inspect, accept or dismiss a JavaScript dialog in the owned background tab. While one is open, the other browser calls return it as dialog instead of acting; answer it here first. Dialogs are tracked from browser_open until browser_close.",
     "browser_set_input_files": "Set absolute local file paths on a file input ref in the owned background tab. Returns a fresh snapshot.",
     "browser_download": "Download a link ref through Chrome Downloads, then move the completed file to an existing absolute directory. Returns final path and a fresh snapshot.",
     "page": "Execute JavaScript, get text, query DOM attributes, click an element or type text in the owned background tab. Mutations return a fresh snapshot.",
@@ -211,9 +223,11 @@ def descriptions(name):
     if name == "list_windows": return "List X11 windows using wmctrl. Linux session must be X11, not Wayland."
     if name == "doctor": return "Report X11 and system utility availability; no permissions are changed."
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
-    if name == "browser_open": return "Open an HTTP(S) URL in an owned Chrome background tab. Always call browser_close on this same connection when finished or on error, before another open."
+    if name == "browser_open": return "Open an HTTP(S) URL in a new background tab of the connected Chrome profile, in a collapsed \"linux-use\" tab group, kept rendering while it stays in the background (Chrome shows its debugging bar until browser_close). Always call browser_close on this same connection when finished or on error, before another open."
+    if name == "browser_snapshot": return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text. Pass query to get only the controls you need."
+    if name == "browser_status": return "Report whether the Chrome extension is installed, connected and current: state is connected, busy, outdated, not_connected or not_installed, with a hint for the last four. Never fails; answers within 2 seconds."
     if name == "browser_close": return "Release this session and best-effort close its inactive, non-user-owned tab. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Preserve tabs taken over by the user."
-    if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards."
+    if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards. Yields with human_activity if the user selects the tab; a page that does not answer within 30 seconds returns tab_unresponsive and its tab is released."
     if name.startswith("browser_"): return "Use the separately registered Chrome extension for owned background tabs; page content may contain private information."
     if name == "get_ui_tree": return ("AT-SPI tree of the exact X11 window, one row per element: - [ax_<n>] role \"name\" (description) = \"value\" {states} [actions]. "
                                       "Returns state_token; pass an ax_<n> id with that token as expected_state_token to click_element or set_value. "
@@ -333,27 +347,24 @@ def _call_tool(name, args):
         if x11_available() and shutil.which("xwd") and (shutil.which("convert") or shutil.which("magick")):
             supported += ["restore_window", "screenshot", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
         supported += cua_native.available_tools(sys.modules[__name__])
-        if x11_available() and shutil.which("wmctrl") and cua_native.health(sys.modules[__name__])["atspi_available"]:
+        atspi_ready = bool(x11_available() and shutil.which("wmctrl") and cua_native.health(sys.modules[__name__])["atspi_available"])
+        if atspi_ready:
             supported += ["get_ui_tree", "click_element"] + (["run_subtask"] if jev_route() else [])
-        browser_available = browser_bridge_available()
-        browser_status = None
-        if browser_available:
-            try:
-                browser_status = browser_request("browser_status", {})
-            except Unsupported:
-                browser_available = False
-        status_valid = isinstance(browser_status, dict) and browser_status.get("connected") is True
-        if not status_valid:
-            browser_available = False
-        owns_browser_tab = status_valid and browser_status.get("hasTab") is True
-        jev_available = bool(owns_browser_tab and jev_route())
+        # A bridge that is not listening cannot answer; say why without waiting for a reconnect.
+        browser_status = extension_status() if browser_bridge_available() else extension_missing(EXTENSION_NOT_CONNECTED)
+        browser_available = browser_status.get("connected") is True
+        owns_browser_tab = browser_available and browser_status.get("hasTab") is True
+        # The decision model needs a key and something to observe: the owned tab or an AT-SPI window.
+        jev_available = bool(jev_route() and (owns_browser_tab or atspi_ready))
         return text_result({"platform": sys.platform, "display": bool(os.environ.get("DISPLAY")), "session_type": os.environ.get("XDG_SESSION_TYPE"),
                             "x11_only": True, "human_activity_check": cua_native.health(sys.modules[__name__])["human_activity_check"], "wmctrl": shutil.which("wmctrl"), "xdotool": shutil.which("xdotool"),
                             "supported_native_tools": supported,
                             "supported_browser_tools": [x for x in BASE_TOOLS if x.startswith("browser_") or x == "page"] if browser_available else [],
+                            "chrome_extension": browser_status,
                             "decision_tool_prerequisites_met": jev_available,
                             "jev_prerequisites": {"credential_configured": jev_route() is not None,
                                                   "owned_chrome_tab": owns_browser_tab,
+                                                  "atspi_windows": atspi_ready,
                                                   "does_not_prove_model_request_success": True},
                             "unsupported": [x for x in BASE_TOOLS if x not in ("doctor", *supported)
                                             and not ((x.startswith("browser_") or x == "page") and browser_available)
@@ -364,6 +375,8 @@ def _call_tool(name, args):
         return text_result(list_windows())
     if name == "browser_download":
         return text_result(browser_download(args))
+    if name == "browser_status":
+        return text_result(extension_status())
     if name.startswith("browser_") or name == "page":
         return text_result(browser_request(name, args), error=False)
     if name == "jev_decide":
@@ -437,10 +450,14 @@ def _call_tool(name, args):
                         "next_step": "MCP caller visual model may submit native_visual_propose; a separate native_visual_execute call is required",
                         "decision_model": "MCP caller visual reasoning; image is not sent to Jev",
                         "provenance": "state token binds target and pixels but does not prove that a model examined the image"}}
-        return {"content": [
+        content = [
             {"type": "image", "data": base64.b64encode(image).decode("ascii"), "mimeType": "image/png"},
             {"type": "text", "text": json.dumps(metadata, sort_keys=True)},
-        ]}
+        ]
+        hint = browser_tools_hint(window["pid"])
+        if hint:
+            content.append({"type": "text", "text": hint})
+        return {"content": content}
     if name in ("left_click", "type", "key", "scroll"):
         window, _ = verified_target(args, require_token=True, verify_screenshot=True)
         wid = hex(window["window_id"])
@@ -493,7 +510,7 @@ def handle(message):
     if method.startswith("notifications/") or ident is None:
         return None
     if method == "initialize":
-        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.3.2"}, "instructions": "Read the installed linux-use skill before using these tools (repository: skills/linux-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Linux native desktop controls are X11-only. Native app lifecycle, desktop state, background/foreground input, clipboard, window frames, config, sessions, agent cursor and trajectory recording/replay are available; health_report reports utility and human-activity-check availability. Foreground delivery restores prior focus; move_cursor window scope only moves the overlay. doctor/list_windows and explicit wmctrl restore_window plus xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens are available when their utilities exist. Chrome automation is available through the separately registered extension. Prefer jev_decide or verify_state with expect.criteria before screenshots: Jev uses cheap text-only filtered evidence, never screenshots or field values. verify_state accepts browser:true for owned Chrome labels or native window titles and AT-SPI labels; without credentials it returns unknown with filtered evidence. Jev action advice is available only for an owned Chrome tab with configured credentials; it sends filtered control labels and returns proposals without executing actions; risky controls (delete/send/purchase/close) need allowed_risks and browser_act returns a fresh snapshot, so earlier refs are stale. For native X11 windows, screenshot returns an image to the MCP caller's visual model (not Jev); that model may submit a one-use native_visual_propose tied to the image target/token, then native_visual_execute revalidates before input. This token does not prove proposal origin. Jev remains available for structured owned Chrome observations. Window restoration changes the active window and is explicit."}}
+        return {"jsonrpc": "2.0", "id": ident, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "linux-use", "version": "1.3.2"}, "instructions": "Read the installed linux-use skill before using these tools (repository: skills/linux-use/SKILL.md). Track resources created by this task and clean them up on success, failure, or cancellation before responding. Preserve pre-existing resources, user takeovers, and requested deliverables. After each browser use, call browser_close on the same MCP connection and verify the result plus browser_status; released does not mean closed. Report cleanup that cannot be verified. Linux native desktop controls are X11-only. Native app lifecycle, desktop state, background/foreground input, clipboard, window frames, config, sessions, agent cursor and trajectory recording/replay are available; health_report reports utility and human-activity-check availability. Foreground delivery restores prior focus; move_cursor window scope only moves the overlay. doctor/list_windows and explicit wmctrl restore_window plus xwd/ImageMagick screenshots and xdotool click/type/key/scroll for exact windows with fresh state tokens are available when their utilities exist. Chrome automation is available through the separately registered extension: call browser_status and use the browser tools when its state is connected; browser_snapshot takes query to return only matching controls. On human_activity in your tab, browser_close it and browser_open a new background tab; if the work must stay in that tab, retry with allow_while_user_active: true unless the user said not to interrupt them. A JavaScript dialog comes back as dialog; answer it with browser_dialog. tab_unresponsive means the page did not answer within 30 seconds and its tab was released; open a new one. Prefer jev_decide or verify_state with expect.criteria before screenshots: Jev uses cheap text-only filtered evidence, never screenshots or field values. verify_state accepts browser:true for owned Chrome labels or native window titles and AT-SPI labels; without credentials it returns unknown with filtered evidence. Jev action advice is available only for an owned Chrome tab with configured credentials; it sends filtered control labels and returns proposals without executing actions; risky controls (delete/send/purchase/close) need allowed_risks and browser_act returns a fresh snapshot, so earlier refs are stale. For native X11 windows, screenshot returns an image to the MCP caller's visual model (not Jev); that model may submit a one-use native_visual_propose tied to the image target/token, then native_visual_execute revalidates before input. This token does not prove proposal origin. Jev remains available for structured owned Chrome observations. Window restoration changes the active window and is explicit."}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": ident, "result": {"tools": schemas()}}
     if method == "tools/call":
@@ -512,19 +529,35 @@ def install_host(extension_id, home=None):
     if not re.fullmatch(r"[a-p]{32}", extension_id):
         raise ValueError("Expected a 32-character Chrome extension ID containing letters a-p.")
     home = Path(home or Path.home())
-    manifest_dir = home / ".config/google-chrome/NativeMessagingHosts"
+    path = host_registration(home)
     host_dir = home / ".local/lib/linux-use"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     host_dir.mkdir(parents=True, exist_ok=True)
     host = host_dir / "chrome-native-host"
     script = "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -u " + shlex.quote(str(Path(__file__).resolve())) + " chrome-native-host \"$@\"\n"
     host.write_text(script, encoding="utf8")
     host.chmod(0o700)
     manifest = {"name": HOST, "description": "linux-use Chrome native messaging host", "path": str(host), "type": "stdio", "allowed_origins": [f"chrome-extension://{extension_id}/"]}
-    path = manifest_dir / f"{HOST}.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf8")
     path.chmod(0o600)
     return str(path)
+
+
+def host_registration(home=None):
+    """Where install_host registers the native host; Google Chrome reads it from here."""
+    return Path(home or Path.home()) / ".config/google-chrome/NativeMessagingHosts" / f"{HOST}.json"
+
+
+def installed_extension_id(home=None):
+    """The extension ID install_host registered, or None when no valid registration exists."""
+    try:
+        origins = json.loads(host_registration(home).read_text(encoding="utf8"))["allowed_origins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(origins, list) or len(origins) != 1 or not isinstance(origins[0], str):
+        return None
+    match = re.fullmatch(r"chrome-extension://([a-p]{32})/", origins[0])
+    return match[1] if match else None
 
 
 def _read_frame(stream):
@@ -554,23 +587,112 @@ def browser_bridge_available():
         return False
 
 
-def browser_request(operation, arguments):
-    request = {"id": str(uuid.uuid4()), "operation": operation, "session": BROWSER_SESSION, "arguments": arguments}
+class BridgeTimeout(Unsupported):
+    """The extension is connected but did not answer in time; it may be running another request."""
+
+
+CHROME_PROCESSES = {"chrome", "chromium", "chromium-browse"}
+EXTENSION_NOT_CONNECTED = ("The linux-use Chrome extension is not connected. It reconnects every 30 seconds; its toolbar button "
+                           "reconnects at once. If it is not in this Chrome profile, load the extension folder in chrome://extensions.")
+
+
+def process_name(pid):
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(20)
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def chrome_running():
+    try:
+        return any(process_name(entry.name) in CHROME_PROCESSES for entry in Path("/proc").iterdir() if entry.name.isdigit())
+    except OSError:
+        return False
+
+
+def browser_tools_hint(pid):
+    """A page answers DOM refs in a background tab far better than clicks in the Chrome window, so
+    say so when the caller looks at Chrome and the extension is there to use."""
+    if process_name(pid) not in CHROME_PROCESSES or not browser_bridge_available():
+        return None
+    return ("hint: the linux-use Chrome extension is connected. For web pages use browser_open and the browser_* tools "
+            "(own background tab, DOM refs); use this window only for Chrome's own controls.")
+
+
+def browser_request(operation, arguments, timeout=40):
+    """`timeout` outlasts the extension (30 s) and the native host (35 s), so their own answer arrives first."""
+    request = {"id": str(uuid.uuid4()), "operation": operation, "session": BROWSER_SESSION, "arguments": arguments}
+    start = time.monotonic()
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
             client.connect(str(BRIDGE_PATH))
-            _write_frame(client.makefile("wb"), request)
-            response = _read_frame(client.makefile("rb"))
-    except (OSError, ValueError, EOFError) as exc:
-        if operation == "browser_status":
-            return {"connected": False, "mode": "current_chrome_profile", "reason": "Chrome extension is not connected."}
-        raise Unsupported("Chrome extension is not connected; no browser request was performed.") from exc
+            break
+        except OSError as exc:
+            client.close()
+            running = chrome_running()
+            # The extension reconnects about a second after a drop; wait that out while Chrome is up.
+            if not running or time.monotonic() - start >= min(3, timeout / 2):
+                raise Unsupported(EXTENSION_NOT_CONNECTED if running
+                                  else "Google Chrome is not running, so the linux-use extension is not connected.") from exc
+            time.sleep(0.1)
+    with client:
+        client.settimeout(timeout - (time.monotonic() - start))
+        try:
+            with client.makefile("wb") as writer:
+                _write_frame(writer, request)
+            with client.makefile("rb") as reader:
+                response = _read_frame(reader)
+        except socket.timeout as exc:
+            raise BridgeTimeout("Chrome bridge timed out. Check the tab before retrying an action.") from exc
+        except (OSError, EOFError) as exc:
+            raise Unsupported("The Chrome extension stopped answering and its bridge restarted. "
+                              "It reconnects by itself; call browser_status, then retry.") from exc
+        except ValueError as exc:
+            raise Unsupported("Invalid Chrome message.") from exc
     if response.get("id") != request["id"]:
         raise Unsupported("Chrome response did not match this request.")
     if response.get("ok") is not True:
         raise Unsupported(str(response.get("error", "Chrome request failed.")))
     return {key: value for key, value in response.items() if key not in ("id", "ok")}
+
+
+# The extension version that keeps its tab awake and answers every request before the host's limit.
+MINIMUM_EXTENSION_VERSION = "1.5.0"
+
+
+def _version(value):
+    try:
+        return tuple(int(part) for part in value.split("."))
+    except (AttributeError, ValueError):
+        return ()
+
+
+def extension_status(timeout=2):
+    """What can be known about the extension without waiting on a page: installed, connected,
+    answering and recent enough. Never raises: a status question deserves a status answer."""
+    try:
+        status = browser_request("browser_status", {}, timeout=timeout)
+    except BridgeTimeout:
+        return {"connected": True, "state": "busy", "hint": "The extension is connected and running another request. Retry shortly."}
+    except Exception as exc:
+        return extension_missing(str(exc))
+    if _version(status.get("version")) >= _version(MINIMUM_EXTENSION_VERSION):
+        status["state"] = "connected"
+    else:
+        status["state"] = "outdated"
+        status["hint"] = (f"Chrome is running an older copy of the extension than this server needs ({MINIMUM_EXTENSION_VERSION}); "
+                          "background tabs can freeze. Reload it in chrome://extensions.")
+    return status
+
+
+def extension_missing(reason):
+    """Why no extension answered. Chrome starts the native host only from install_host's
+    registration, so an extension that answers needs no registration check."""
+    if installed_extension_id() is None:
+        return {"connected": False, "state": "not_installed",
+                "hint": "Load the extension folder in chrome://extensions (Developer mode, Load unpacked), then run: python3 server.py install-chrome-host EXTENSION_ID."}
+    return {"connected": False, "state": "not_connected", "hint": reason}
 
 
 def browser_download(args):
@@ -1026,10 +1148,31 @@ def jev_decide(goal, allowed_risks=None, min_confidence=None, min_margin=None):
     return proposal
 
 
-def native_host():
-    """Multiplex Chrome native messaging with the local MCP-to-extension socket."""
+def _read_frame_fd(fd, deadline):
+    """One frame from a raw descriptor by `deadline` (time.monotonic()). Raw reads, because select
+    cannot see bytes a buffered reader has already taken."""
+    def exactly(size):
+        data = b""
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                raise TimeoutError("frame deadline passed")
+            chunk = os.read(fd, size - len(data))
+            if not chunk: raise EOFError
+            data += chunk
+        return data
+    size = struct.unpack("<I", exactly(4))[0]
+    if not 1 <= size <= 1_048_576: raise ValueError("Invalid frame size")
+    return json.loads(exactly(size))
+
+
+def native_host(response_timeout=35):
+    """Multiplex Chrome native messaging with the local MCP-to-extension socket. A caller has 2 s to
+    send its request; the extension has `response_timeout`, under the caller's 40 s, to answer it."""
     origin = sys.argv[2] if len(sys.argv) > 2 else ""
-    if not re.fullmatch(r"chrome-extension://[a-p]{32}/", origin): return
+    extension_id = installed_extension_id()
+    # Serve only the extension install_host registered, whatever origin the launcher was given.
+    if extension_id is None or origin != f"chrome-extension://{extension_id}/": return
     BRIDGE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(BRIDGE_PATH.parent, 0o700)
     lock_file = open(BRIDGE_PATH.with_suffix(".lock"), "a")
@@ -1039,22 +1182,42 @@ def native_host():
         lock_file.close()
         return
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stdin = sys.stdin.fileno()
     try:
         BRIDGE_PATH.unlink(missing_ok=True)
         listener.bind(str(BRIDGE_PATH)); os.chmod(BRIDGE_PATH, 0o600); listener.listen(8)
         while True:
-            ready, _, _ = select.select([listener, sys.stdin.buffer], [], [])
-            if sys.stdin.buffer in ready: return
+            ready, _, _ = select.select([listener, stdin], [], [])
+            # Chrome's pipe closing means the extension disconnected; leave no host or action behind.
+            if stdin in ready: return
             client, _ = listener.accept()
             with client:
                 try:
-                    request = _read_frame(client.makefile("rb"))
-                    _write_frame(sys.stdout.buffer, request)
-                    response = _read_frame(sys.stdin.buffer)
-                    if response.get("id") != request.get("id"): raise ValueError("Response ID mismatch")
-                    _write_frame(client.makefile("wb"), response)
+                    request = _read_frame_fd(client.fileno(), time.monotonic() + 2)
                 except (ValueError, EOFError, OSError):
                     continue
+                if not isinstance(request, dict): continue
+                client.settimeout(1)
+                try:
+                    _write_frame(sys.stdout.buffer, request)
+                    response = _read_frame_fd(stdin, time.monotonic() + response_timeout)
+                except (ValueError, EOFError, OSError):
+                    # Say why before exiting; a silent close reads as a dead bridge. Chrome starts a
+                    # clean host when the extension reconnects.
+                    try:
+                        with client.makefile("wb") as writer:
+                            _write_frame(writer, {"id": request.get("id", ""), "ok": False,
+                                                  "error": "Chrome extension did not answer. It reconnects by itself; check browser_status before retrying."})
+                    except OSError:
+                        pass
+                    return
+                if not isinstance(response, dict) or response.get("id") != request.get("id"): return
+                # A caller can disappear after an action. Do not replay it.
+                try:
+                    with client.makefile("wb") as writer:
+                        _write_frame(writer, response)
+                except OSError:
+                    pass
     finally:
         listener.close(); BRIDGE_PATH.unlink(missing_ok=True); lock_file.close()
 
@@ -1075,6 +1238,18 @@ def main():
             response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}}
         if response is not None:
             sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n"); sys.stdout.flush()
+    close_browser_on_exit()
+
+
+def close_browser_on_exit():
+    """The client is gone. An agent that never reached browser_close would leave its tab open with
+    Chrome's debugging bar showing, and nothing else is listening to close it."""
+    if not browser_bridge_available():
+        return
+    try:
+        browser_request("browser_close", {})
+    except Unsupported:
+        pass
 
 if __name__ == "__main__":
     main()

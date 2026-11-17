@@ -775,7 +775,9 @@ def dispatch(s, name, args):
     validate(args, schema(name))
     if args.get("session") and name != "start_session" and args["session"] != SESSION["session"]:
         raise s.Unsupported("Unknown session; call start_session with this identity first.")
-    if name in ("check_permissions", "health_report"):
+    if name == "health_report":
+        return {**health(s), "chrome_extension": s.extension_status()}
+    if name == "check_permissions":
         return health(s)
     if name == "get_config":
         return get_config(s)

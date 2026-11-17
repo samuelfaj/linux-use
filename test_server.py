@@ -1,9 +1,15 @@
+import contextlib
 import json
 import os
 import fcntl
+import io
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import server
 
@@ -48,7 +54,7 @@ class MCPTests(unittest.TestCase):
             lock_file = open(lock_path, "a")
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
-                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(
+                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(server, "installed_extension_id", return_value="a" * 32), patch.object(
                     server.sys, "argv", ["server.py", "chrome-native-host", "chrome-extension://" + "a" * 32 + "/"]
                 ):
                     server.native_host()
@@ -64,10 +70,12 @@ class MCPTests(unittest.TestCase):
                 self.assertFalse(server.browser_bridge_available())
 
     def test_browser_tools_route_to_extension_and_status_reports_disconnected(self):
-        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False}) as request:
+        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": server.MINIMUM_EXTENSION_VERSION}) as request:
             result = json.loads(server.call_tool("browser_status", {})["content"][0]["text"])
         self.assertTrue(result["connected"])
-        request.assert_called_once_with("browser_status", {})
+        self.assertEqual(result["state"], "connected")
+        # A status question must not wait behind a slow page the way an action may.
+        request.assert_called_once_with("browser_status", {}, timeout=2)
         with patch.object(server, "browser_request", return_value={"url": "https://example.com/", "loading": True}) as request:
             result = json.loads(server.call_tool("browser_open", {"url": "https://example.com/"})["content"][0]["text"])
         self.assertTrue(result["loading"])
@@ -1046,6 +1054,230 @@ class BrowserPortTests(unittest.TestCase):
                 request.assert_called_once_with(name, arguments)
                 self.assertTrue(tools[name]["inputSchema"]["properties"])
                 self.assertNotIn("separately registered", tools[name]["description"])
+
+    def test_every_page_tool_lets_the_caller_escalate_and_the_flag_reaches_the_extension(self):
+        # The extension refuses a tab the user selected unless the call carries allow_while_user_active.
+        # The schemas forbid unknown properties, so a tool without it could never escalate; and only
+        # the extension can tell whether the user is on the tab, so the server must pass it through.
+        tools = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}
+        for name in server.BROWSER_PAGE_TOOLS:
+            with self.subTest(name=name):
+                self.assertEqual(tools[name]["properties"]["allow_while_user_active"]["type"], "boolean")
+                self.assertFalse(tools[name]["additionalProperties"])
+        # A dialog in a tab the user selected is theirs; open, close and status act on no page.
+        others = {"browser_dialog", "browser_open", "browser_close", "browser_status"}
+        for name in others:
+            self.assertNotIn("allow_while_user_active", tools[name]["properties"])
+        # A new browser tool has to be classified one way or the other.
+        self.assertEqual(set(server.BROWSER_PAGE_TOOLS) | others,
+                         {name for name in server.BASE_TOOLS if name.startswith("browser_") or name == "page"})
+        with patch.object(server, "browser_request", return_value={"url": "https://example.com/"}) as request:
+            server.call_tool("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+        request.assert_called_once_with("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+
+    def test_snapshot_query_is_accepted_and_forwarded(self):
+        # A long page buries the one control a task needs past the 200-element cap; query is how the
+        # caller reaches it, so the schema must admit it and the server must forward it unchanged.
+        schema = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}["browser_snapshot"]
+        self.assertEqual(schema["properties"]["query"]["type"], "string")
+        with patch.object(server, "browser_request", return_value={"elements": []}) as request:
+            server.call_tool("browser_snapshot", {"query": "delete app"})
+        request.assert_called_once_with("browser_snapshot", {"query": "delete app"})
+
+    def test_extension_status_names_every_state_and_never_raises(self):
+        # browser_status is the agent's first browser call. Each state means a different next step
+        # (use the tools, retry, reload, reconnect, install), so none may be mistaken for another,
+        # and a status question must get a status answer rather than an error.
+        current = {"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": "1.5.0"}
+        cases = [
+            ({"return_value": current}, "a" * 32, "connected"),
+            # Versions compare by number: 1.10.0 is newer than 1.5.0 although it sorts first as text.
+            ({"return_value": {**current, "version": "1.10.0"}}, "a" * 32, "connected"),
+            ({"return_value": {**current, "version": "1.3.1"}}, "a" * 32, "outdated"),
+            ({"return_value": {key: value for key, value in current.items() if key != "version"}}, "a" * 32, "outdated"),
+            ({"side_effect": server.BridgeTimeout("timed out")}, "a" * 32, "busy"),
+            ({"side_effect": server.Unsupported("not connected")}, "a" * 32, "not_connected"),
+            ({"side_effect": server.Unsupported("not connected")}, None, "not_installed"),
+            ({"side_effect": RuntimeError("unexpected")}, "a" * 32, "not_connected"),
+        ]
+        for request, registered, state in cases:
+            with self.subTest(state=state, request=request), patch.object(server, "browser_request", **request), patch.object(
+                server, "installed_extension_id", return_value=registered
+            ):
+                status = server.extension_status()
+            self.assertEqual(status["state"], state)
+            self.assertEqual(status["connected"], state in ("connected", "outdated", "busy"))
+            self.assertEqual("hint" in status, state != "connected")
+
+    def test_browser_status_answers_with_a_state_when_the_bridge_is_down(self):
+        # With Chrome closed there is no bridge socket; the tool must still answer, not fail, and say why.
+        with tempfile.TemporaryDirectory() as home, patch.object(server, "BRIDGE_PATH", Path(home) / "bridge.sock"), patch.object(
+            server, "chrome_running", return_value=False
+        ):
+            server.install_host("a" * 32, home)
+            with patch.object(server.Path, "home", return_value=Path(home)):
+                result = server.call_tool("browser_status", {})
+        status = json.loads(result["content"][0]["text"])
+        self.assertFalse(result["isError"])
+        self.assertEqual(status["state"], "not_connected")
+        self.assertTrue(status["hint"])
+
+    def test_bridge_waits_out_an_extension_reconnect_but_not_a_closed_chrome(self):
+        # The extension reconnects about a second after a drop, so a call made in that gap should land
+        # instead of failing. With Chrome closed nothing will reconnect, so fail at once and say why.
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with patch.object(server, "chrome_running", return_value=False):
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "Chrome is not running"):
+                    server.browser_request("browser_snapshot", {})
+                self.assertLess(time.monotonic() - start, 0.5)
+
+            def reconnect_then_answer():
+                time.sleep(0.3)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.bind(str(server.BRIDGE_PATH))
+                    listener.listen(1)
+                    client, _ = listener.accept()
+                    with client:
+                        request = server._read_frame(client.makefile("rb"))
+                        server._write_frame(client.makefile("wb"), {"id": request["id"], "ok": True, "url": "https://example.com/"})
+                server.BRIDGE_PATH.unlink()
+
+            extension = threading.Thread(target=reconnect_then_answer)
+            extension.start()
+            with patch.object(server, "chrome_running", return_value=True):
+                self.assertEqual(server.browser_request("browser_snapshot", {}), {"url": "https://example.com/"})
+                extension.join()
+                # Chrome is up but the extension never comes back: give up after the wait, with the reconnect hint.
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "extension is not connected. It reconnects"):
+                    server.browser_request("browser_snapshot", {}, timeout=1)
+                self.assertGreaterEqual(time.monotonic() - start, 0.5)
+
+    def test_bridge_failures_say_which_failure_happened(self):
+        # A closed bridge means "check browser_status and retry"; a timeout means the action may have
+        # run, so "check the tab before retrying". The caller can only choose if the messages differ.
+        def bridge():
+            server.BRIDGE_PATH.unlink(missing_ok=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(server.BRIDGE_PATH))
+            listener.listen(1)
+            return listener
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with bridge():
+                with self.assertRaisesRegex(server.BridgeTimeout, "timed out. Check the tab"):
+                    server.browser_request("browser_snapshot", {}, timeout=0.3)
+            with bridge() as listener:
+                closing = threading.Thread(target=lambda: listener.accept()[0].close())
+                closing.start()
+                with self.assertRaisesRegex(server.Unsupported, "stopped answering") as caught:
+                    server.browser_request("browser_snapshot", {}, timeout=2)
+                closing.join()
+                self.assertNotIsInstance(caught.exception, server.BridgeTimeout)
+
+    def test_native_host_tells_the_caller_when_the_extension_never_answers(self):
+        # A page Chrome froze kept the extension from answering; the host waited forever and every
+        # later call hung behind it. Now the caller hears why, and the host exits so Chrome starts a
+        # clean one when the extension reconnects.
+        origin = "chrome-extension://" + "a" * 32 + "/"
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        with contextlib.ExitStack() as stack:
+            for fd in (stdin_r, stdin_w, stdout_r, stdout_w):
+                stack.callback(os.close, fd)
+            bridge = Path(stack.enter_context(tempfile.TemporaryDirectory())) / "bridge.sock"
+            chrome_reads = stack.enter_context(open(stdout_r, "rb", closefd=False))
+            host_stdin = stack.enter_context(open(stdin_r, "rb", closefd=False))
+            host_stdout = stack.enter_context(open(stdout_w, "wb", closefd=False))
+            for target, name, value in ((server, "BRIDGE_PATH", bridge), (server, "installed_extension_id", lambda: "a" * 32),
+                                        (server.sys, "argv", ["server.py", "chrome-native-host", origin]),
+                                        (server.sys, "stdin", host_stdin), (server.sys, "stdout", SimpleNamespace(buffer=host_stdout))):
+                stack.enter_context(patch.object(target, name, value))
+            host = threading.Thread(target=server.native_host, kwargs={"response_timeout": 0.3}, daemon=True)
+            host.start()
+            deadline = time.monotonic() + 2
+            while not bridge.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as caller:
+                caller.settimeout(5)  # a host without its deadline fails this test instead of hanging it
+                caller.connect(str(bridge))
+                with caller.makefile("wb") as writer:
+                    server._write_frame(writer, {"id": "r1", "operation": "browser_snapshot"})
+                with caller.makefile("rb") as reader:
+                    answer = server._read_frame(reader)
+            host.join(2)
+            self.assertEqual(server._read_frame(chrome_reads)["id"], "r1")
+        self.assertEqual(answer["id"], "r1")
+        self.assertIs(answer["ok"], False)
+        self.assertIn("did not answer", answer["error"])
+        self.assertFalse(host.is_alive())
+        self.assertFalse(bridge.exists())
+
+    def test_native_host_serves_only_the_registered_extension(self):
+        # The host is a plain script anyone can start with any origin argument; only the extension
+        # install_host registered may open the bridge into the user's Chrome profile.
+        for registered, origin in (("a" * 32, "chrome-extension://" + "b" * 32 + "/"), (None, "chrome-extension://" + "a" * 32 + "/")):
+            with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory, open(os.devnull, "rb") as stdin, patch.object(
+                server, "BRIDGE_PATH", Path(directory) / "bridge.sock"
+            ), patch.object(server, "installed_extension_id", return_value=registered), patch.object(
+                server.sys, "argv", ["server.py", "chrome-native-host", origin]
+            ), patch.object(server.sys, "stdin", stdin):
+                server.native_host()
+                self.assertFalse(server.BRIDGE_PATH.with_suffix(".lock").exists())
+
+    def test_client_exit_closes_the_agents_tab_only_when_the_bridge_is_up(self):
+        # An agent that never reached browser_close would leave its tab, and Chrome's debugging bar,
+        # open for good. With no bridge there is no tab to close, and exit must not wait on a reconnect.
+        for available in (True, False):
+            with self.subTest(available=available), patch.object(server, "browser_bridge_available", return_value=available), patch.object(
+                server, "browser_request", side_effect=server.Unsupported("tab already gone")
+            ) as request, patch.object(server.sys, "argv", ["server.py"]), patch.object(server.sys, "stdin", io.StringIO("")):
+                server.main()  # a failed close must not turn a clean exit into a crash
+            if available:
+                request.assert_called_once_with("browser_close", {})
+            else:
+                request.assert_not_called()
+
+    def test_screenshot_of_chrome_points_at_the_browser_tools(self):
+        # Web content answers DOM refs in a background tab far better than pixel clicks in the user's
+        # Chrome window, so a caller looking at Chrome should learn the extension is there to use.
+        for name, available, expected in (("chrome", True, True), ("chrome", False, False), ("gedit", True, False)):
+            with self.subTest(name=name, available=available), patch.object(server, "process_name", return_value=name), patch.object(
+                server, "browser_bridge_available", return_value=available
+            ):
+                self.assertEqual(server.browser_tools_hint(4321) is not None, expected)
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"png"), patch.object(
+            server, "process_name", return_value="chrome"
+        ), patch.object(server, "browser_bridge_available", return_value=True):
+            content = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})["content"]
+        self.assertEqual(content[0]["type"], "image")
+        self.assertIn("browser_open", content[-1]["text"])
+
+    def test_installed_extension_id_reads_what_install_host_registered(self):
+        # The native host trusts only this origin and browser_status says not_installed without it,
+        # so it must read exactly what install_host writes and reject anything else.
+        with tempfile.TemporaryDirectory() as home:
+            self.assertIsNone(server.installed_extension_id(home))
+            server.install_host("b" * 32, home)
+            self.assertEqual(server.installed_extension_id(home), "b" * 32)
+            origin = "chrome-extension://{}/".format
+            for broken in ("not json", "[]", json.dumps({"allowed_origins": [origin("b" * 32), origin("c" * 32)]}),
+                           json.dumps({"allowed_origins": [origin("z" * 32)]})):
+                server.host_registration(home).write_text(broken)
+                self.assertIsNone(server.installed_extension_id(home))
+
+    def test_doctor_and_health_report_include_the_extension_state(self):
+        # Diagnostics are where a user looks when browser tools are missing; they must say which state.
+        with patch.object(server, "browser_bridge_available", return_value=False), patch.object(
+            server, "installed_extension_id", return_value=None
+        ):
+            doctor = json.loads(server.call_tool("doctor", {})["content"][0]["text"])
+        self.assertEqual(doctor["chrome_extension"]["state"], "not_installed")
+        self.assertEqual(doctor["supported_browser_tools"], [])
+        with patch.object(server, "extension_status", return_value={"connected": True, "state": "busy", "hint": "retry"}):
+            health = json.loads(server.call_tool("health_report", {})["content"][0]["text"])
+        self.assertEqual(health["chrome_extension"]["state"], "busy")
 
     def test_download_moves_completed_file_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(server.Path, "home", return_value=Path(folder)):
