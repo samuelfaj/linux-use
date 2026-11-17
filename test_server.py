@@ -1,11 +1,28 @@
+import contextlib
 import json
 import os
 import fcntl
+import io
+import socket
+import struct
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import server
+
+
+def sent(run, verb):
+    """The xdotool commands of one kind that a run_cli mock received."""
+    return [call.args for call in run.call_args_list if call.args[:2] == ("xdotool", verb)]
+
+
+def png(width, height, tag=b""):
+    """The first bytes of a PNG of this size: enough for the server to read its IHDR."""
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", width, height) + tag
 
 
 class MCPTests(unittest.TestCase):
@@ -14,6 +31,9 @@ class MCPTests(unittest.TestCase):
     def setUp(self):
         server.NATIVE_VISUAL_PROPOSALS.clear()
         server.NATIVE_VISUAL_OBSERVATIONS.clear()
+        server.cua_native.AGENT_INPUT["at"] = float("-inf")
+        server.CAPTURE["stalled_until"] = float("-inf")
+        server.cua_native.SCREENSHOTS.clear()
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -21,6 +41,10 @@ class MCPTests(unittest.TestCase):
         idle_check = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         idle_check.start()
         self.addCleanup(idle_check.stop)
+        # Whether xprop is installed must not change which X11 calls a test sees; minimized windows have their own tests.
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"
@@ -33,12 +57,49 @@ class MCPTests(unittest.TestCase):
         init = server.handle({"jsonrpc":"2.0", "id":1, "method":"initialize"})
         self.assertEqual(init["result"]["protocolVersion"], "2024-11-05")
         tools = server.handle({"jsonrpc":"2.0", "id":2, "method":"tools/list"})["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS))
+        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS) - server.UNLISTED_TOOLS)
         self.assertTrue(all("inputSchema" in t for t in tools))
         listed = {tool["name"]: tool for tool in tools}
         self.assertEqual(listed["native_visual_propose"]["inputSchema"]["required"],
                          ["target_pid", "target_window_id", "expected_state_token", "action", "decision"])
         self.assertEqual(listed["native_visual_execute"]["inputSchema"]["required"], ["proposal_id"])
+
+    def test_an_argument_the_tool_does_not_take_is_refused_with_the_ones_it_does(self):
+        # A screenshot "width" was dropped in silence, the image came back at another size and every
+        # click computed from the expected size missed. The refusal is a tool result the model reads,
+        # and it names what the tool takes; legacy tools are checked like the others.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            reply = server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                "name": "screenshot", "arguments": {"target_pid": 4321, "target_window_id": 0x1234, "width": 900}}})
+            self.assertTrue(reply["result"]["isError"])
+            self.assertIn("unknown argument: width; accepted: ", reply["result"]["content"][0]["text"])
+            self.assertIn("max_image_dimension", reply["result"]["content"][0]["text"])
+            refused = server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 1, "width": 900})["content"][0]["text"]
+            self.assertTrue(all(name in refused for name in ("accepted:", "delivery_mode", "expected_state_token")), refused)
+            token = server.state_token(self.window, b"pixels")
+            self.assertTrue(server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                "expected_state_token": token, "coordinate": [1, 2], "button": "right"})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                "expected_state_token": token, "coordinate": [1, 2], "allow_while_user_active": "yes"})
+            capture.assert_not_called()
+            execute.assert_not_called()
+
+    def test_earlier_tool_names_still_run_though_they_are_not_listed(self):
+        # left_click/type/key duplicate click/type_text/press_key with another contract, and
+        # cursor_position always failed; recorded trajectories and visual proposals still call them.
+        listed = {tool["name"] for tool in server.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/list"})["result"]["tools"]}
+        self.assertFalse(listed & {"left_click", "type", "key", "cursor_position"})
+        self.assertTrue({"click", "type_text", "press_key", "get_cursor_position", "zoom", "scroll"} <= listed)
+        token = server.state_token(self.window, b"pixels")
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            result = server.call_tool("key", {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "key": "Return"})
+        self.assertFalse(result["isError"])
+        self.assertEqual(execute.call_args.args, ("xdotool", "key", "--window", "0x1234", "Return"))
 
     def test_second_native_host_does_not_replace_or_unlink_live_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,7 +109,7 @@ class MCPTests(unittest.TestCase):
             lock_file = open(lock_path, "a")
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
-                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(
+                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(server, "installed_extension_id", return_value="a" * 32), patch.object(
                     server.sys, "argv", ["server.py", "chrome-native-host", "chrome-extension://" + "a" * 32 + "/"]
                 ):
                     server.native_host()
@@ -64,10 +125,12 @@ class MCPTests(unittest.TestCase):
                 self.assertFalse(server.browser_bridge_available())
 
     def test_browser_tools_route_to_extension_and_status_reports_disconnected(self):
-        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False}) as request:
+        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": server.MINIMUM_EXTENSION_VERSION}) as request:
             result = json.loads(server.call_tool("browser_status", {})["content"][0]["text"])
         self.assertTrue(result["connected"])
-        request.assert_called_once_with("browser_status", {})
+        self.assertEqual(result["state"], "connected")
+        # A status question must not wait behind a slow page the way an action may.
+        request.assert_called_once_with("browser_status", {}, timeout=2)
         with patch.object(server, "browser_request", return_value={"url": "https://example.com/", "loading": True}) as request:
             result = json.loads(server.call_tool("browser_open", {"url": "https://example.com/"})["content"][0]["text"])
         self.assertTrue(result["loading"])
@@ -94,7 +157,8 @@ class MCPTests(unittest.TestCase):
             server, "browser_request", side_effect=[first, second]
         ) as browser, patch.object(server, "jev_evaluate", return_value=self.jev_response("e0")) as evaluate:
             result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
-        self.assertEqual(result["operation"], "click_element")
+        # The proposal names the tool that executes it on the owned tab.
+        self.assertEqual((result["operation"], result["action"]), ("browser_act", "click"))
         self.assertEqual(result["ref"], "ref-current")
         self.assertEqual(result["state_token"], "token-2")
         self.assertEqual([call.args[0] for call in browser.call_args_list], ["browser_snapshot", "browser_snapshot"])
@@ -104,10 +168,24 @@ class MCPTests(unittest.TestCase):
         self.assertNotIn("private body text", serialized)
         self.assertNotIn("private field value", serialized)
 
-    def test_jev_does_not_contact_model_for_missing_credentials_or_credential_goal(self):
-        with patch.object(server, "jev_route", return_value=None), patch.object(server, "browser_request") as browser, patch.object(server, "jev_evaluate") as evaluate:
-            with self.assertRaisesRegex(server.Unsupported, "No Jev credential"):
-                server.call_tool("jev_decide", {"goal": "Open settings"})
+    def test_jev_without_key_hands_filtered_candidates_to_the_session_llm(self):
+        snapshot = self.browser_snapshot("token-1", "ref-1")
+        snapshot["elements"].append({"ref": "ref-pw", "role": "input", "name": "Login", "type": "password", "value": "hunter2"})
+        snapshot["elements"].append({"ref": "ref-del", "role": "button", "name": "Delete draft", "type": "button"})
+        with patch.object(server, "jev_route", return_value=None), patch.object(
+            server, "browser_request", return_value=snapshot
+        ), patch.object(server, "jev_evaluate") as evaluate:
+            result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
+        evaluate.assert_not_called()
+        self.assertEqual((result["mode"], result["operation"]), ("llm", "DEFER_TO_LLM"))
+        # Only safe candidates: no password field, no risky control the goal did not allow.
+        self.assertEqual(result["candidates"], [{"operation": "browser_act", "action": "click", "ref": "ref-1",
+                                                  "role": "button", "label": "Open"}])
+        self.assertEqual(result["state_token"], "token-1")
+        self.assertNotIn("hunter2", json.dumps(result))
+
+    def test_jev_does_not_contact_model_for_credential_goal(self):
+        with patch.object(server, "browser_request") as browser, patch.object(server, "jev_evaluate") as evaluate:
             with patch.object(server, "jev_route", return_value=("secret", "https://example.test", "jev")):
                 for goal in ("Enter my password", "Enter my PIN 1234", "Enter code 123  456"):
                     with self.subTest(goal=goal), self.assertRaisesRegex(server.Unsupported, "credentials"):
@@ -168,14 +246,34 @@ class MCPTests(unittest.TestCase):
         ]
         self.assertNotEqual(server.jev_snapshot_projection(first), server.jev_snapshot_projection(second))
 
-    def test_jev_done_is_blocked_without_independent_completion_verification(self):
-        snapshot1 = self.browser_snapshot("token-1", "ref-1")
-        snapshot2 = self.browser_snapshot("token-2", "ref-2")
+    def test_jev_done_needs_independent_completion_evidence(self):
+        for completion, expected in ((0.99, "DONE"), (0.5, "BLOCKED")):
+            with self.subTest(completion=completion):
+                response = self.jev_response("DONE")
+                response["answers"]["complete"]["noul"] = completion
+                with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
+                    server, "browser_request", side_effect=[self.browser_snapshot("token-1", "ref-1"), self.browser_snapshot("token-2", "ref-2")]
+                ), patch.object(server, "jev_evaluate", return_value=response):
+                    result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
+                self.assertEqual(result["operation"], expected)
+                if expected == "BLOCKED":
+                    self.assertEqual(result["reason"], "Completion evidence below threshold")
+
+    def test_jev_advice_carries_alternatives_signals_engine_and_block_reason(self):
+        response = self.jev_response("e0")
+        response["answers"]["next"]["probabilities"] = {"e0": 0.70, "WAIT": 0.30, "BLOCKED": 0.0, "DONE": 0.0}
+        response["answers"]["consequential"]["noul"] = 0.9
+        response["answers"]["authorized"]["noul"] = 0.99
+        response.update(engine="typesafe/jev-1.14", fallback_reason="liquid/d1.2-ultra HTTP 503")
         with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
-            server, "browser_request", side_effect=[snapshot1, snapshot2]
-        ), patch.object(server, "jev_evaluate", return_value=self.jev_response("DONE")):
+            server, "browser_request", side_effect=[self.browser_snapshot("token-1", "ref-1"), self.browser_snapshot("token-2", "ref-2")]
+        ), patch.object(server, "jev_evaluate", return_value=response):
             result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
-        self.assertEqual(result["operation"], "BLOCKED")
+        # 0.70 is below the material threshold; the reason lets the session LLM ask the user instead of guessing.
+        self.assertEqual((result["operation"], result["reason"]), ("BLOCKED", "Choice below material confidence threshold"))
+        self.assertEqual(result["signals"], {"complete": 0.99, "consequential": 0.9, "authorized": 0.99})
+        self.assertEqual(result["alternatives"], [{"operation": "WAIT", "probability": 0.30}])
+        self.assertEqual((result["engine"], result["fallback_reason"]), ("typesafe/jev-1.14", "liquid/d1.2-ultra HTTP 503"))
 
     def test_risk_classify_uses_whole_words_and_phrases(self):
         self.assertEqual(server.risk_classify("Empty   Trash"), "delete")
@@ -200,7 +298,7 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(result["operation"], "BLOCKED")
             evaluate.assert_not_called()
         result, evaluate = decide(["delete"])
-        self.assertEqual(result["operation"], "click_element")
+        self.assertEqual(result["operation"], "browser_act")
         self.assertEqual(result["ref"], "ref-2")
 
     def test_jev_risky_target_is_material_even_when_model_says_routine(self):
@@ -223,7 +321,7 @@ class MCPTests(unittest.TestCase):
             ), patch.object(server, "jev_evaluate", return_value=response):
                 return json.loads(server.call_tool("jev_decide", {"goal": "Open settings", **gates})["content"][0]["text"])
         result = decide()
-        self.assertEqual(result["operation"], "click_element")
+        self.assertEqual(result["operation"], "browser_act")
         self.assertAlmostEqual(result["margin"], 0.2)
         result = decide(min_margin=0.5)
         self.assertEqual(result["operation"], "NEEDS_AGENT")
@@ -347,7 +445,7 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "changed during screenshot"):
                 server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
 
-    def test_screenshot_token_can_be_reused_only_for_identical_pixels(self):
+    def test_screenshot_token_is_reproducible_and_refuses_unknown_tokens(self):
         token = server.state_token(self.window, b"same-pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server, "screenshot_png", return_value=b"same-pixels"
@@ -396,7 +494,7 @@ class MCPTests(unittest.TestCase):
             "expected_state_token": [], "action": "key", "key": "Return", "decision": "Press Return"}}})
         self.assertEqual(result["id"], 97)
         self.assertEqual(result["error"]["code"], -32602)
-        self.assertIn("non-empty string", result["error"]["message"])
+        self.assertIn("expected_state_token", result["error"]["message"])
 
     def test_native_visual_proposal_requires_screenshot_from_this_session(self):
         token = server.state_token(self.window, b"pixels")
@@ -422,12 +520,16 @@ class MCPTests(unittest.TestCase):
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[-1]})
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[0]})
 
-    def test_native_visual_proposal_rejects_stale_pixels(self):
+    def test_native_visual_proposal_rejects_a_moved_window(self):
+        # The proposal's coordinates were read from the screenshot's frame; once the window moves
+        # they name another place, so the token is stale before any input.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
             server, "screenshot_png", side_effect=[b"old-pixels", b"new-pixels"]
         ), patch.object(server, "run_cli") as execute:
             server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            live[0] = {**self.window, "geometry": [400, 20, 800, 600]}
             with self.assertRaisesRegex(server.Unsupported, "stale"):
                 server.call_tool("native_visual_propose", {"target_pid": 4321, "target_window_id": 0x1234,
                     "expected_state_token": token, "action": "type", "text": "hello", "decision": "Type text"})
@@ -451,31 +553,125 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "PNG conversion requires ImageMagick"):
                 server.screenshot_png(0x1234)
 
+    def test_clicks_read_from_a_scaled_screenshot_land_on_the_same_place_in_the_window(self):
+        # A 1920x1080 window is given to the caller as 1366x768 and it picks pixels in that image;
+        # read as window pixels they landed up and to the left, on other controls. The result must
+        # also say what size the pixels are measured in.
+        window = {**self.window, "geometry": [0, 0, 1920, 1080]}
+        with patch.object(server, "list_windows", return_value=[window]), patch.object(
+            server, "screenshot_png", return_value=png(1366, 768)
+        ) as capture, patch.object(server, "run_cli", return_value="") as execute:
+            shot = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            seen = json.loads(shot["content"][1]["text"])
+            self.assertEqual((seen["image_size"], seen["window_size"]), ([1366, 768], [1920, 1080]))
+            self.assertEqual(capture.call_args.args, (0x1234, None), "None means the configured limit")
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": seen["state_token"]}
+            server.call_tool("left_click", {**base, "coordinate": [683, 384]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("960", "540"))
+            # A pixel outside the image the caller holds is refused rather than clamped.
+            execute.reset_mock()
+            with self.assertRaisesRegex(ValueError, "1366x768"):
+                server.call_tool("left_click", {**base, "coordinate": [1400, 10]})
+            execute.assert_not_called()
+            # The cua click takes pixels of the last screenshot too.
+            server.call_tool("click", {"window_id": 0x1234, "x": 683, "y": 384})
+            self.assertEqual(sent(execute, "mousemove")[0][-2:], ("960", "540"))
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": 0})
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            with self.assertRaises(ValueError):
+                server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": -1})
+
+    def test_zoom_returns_a_native_crop_whose_pixels_map_into_the_region(self):
+        # zoom was always unsupported, so small text could only be read from the scaled screenshot.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(200, 100)
+        ) as capture, patch.object(server, "run_cli") as execute:
+            zoom = server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": [400, 300, 200, 100]})
+            seen = json.loads(zoom["content"][1]["text"])
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            self.assertEqual(capture.call_args.kwargs, {"crop": [400, 300, 200, 100]})
+            self.assertEqual((seen["image_size"], seen["region"]), ([200, 100], [400, 300, 200, 100]))
+            server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                            "expected_state_token": seen["state_token"], "coordinate": [10, 20]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("410", "320"))
+            for region in ([700, 0, 200, 100], [0, 0, 0, 10], [-1, 0, 10, 10], [0, 0, 10]):
+                with self.subTest(region=region), self.assertRaises(ValueError):
+                    server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": region})
+
+    def test_capture_resizes_to_the_limit_unless_native_or_cropped(self):
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server, "run_cli_bytes", return_value=b"png"
+        ) as run:
+            for dimension, crop, options in ((None, None, ["-resize", "1366x1366>"]), (900, None, ["-resize", "900x900>"]),
+                                             (0, None, []), (0, [5, 6, 20, 10], ["-crop", "20x10+5+6", "+repage"])):
+                with self.subTest(dimension=dimension, crop=crop):
+                    server.screenshot_png(0x1234, dimension, crop=crop)
+                    self.assertEqual(list(run.call_args.args), ["/usr/bin/convert", "xwd:-", *options, "png:-"])
+
+    def test_one_deadline_bounds_the_capture_and_a_stall_then_fails_fast(self):
+        # xwd and the conversion each had their own 8 s timeout, so an X server that stopped answering
+        # cost 16 s on every call. One 12 s deadline covers the whole capture, and after a stall
+        # captures fail at once for 30 s instead of waiting it out again.
+        clock, timeouts = [100.0], []
+        def run(command, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            clock[0] += 5
+            if len(timeouts) == 3:
+                raise server.subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return server.subprocess.CompletedProcess(command, 0, stdout=b"png")
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(server.subprocess, "run", side_effect=run):
+            server.screenshot_png(0x1234, 100)
+            self.assertEqual(timeouts, [12, 7.0], "the conversion gets what xwd left of the 12 s")
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_timeout"):
+                server.screenshot_png(0x1234, 100)
+            ran = len(timeouts)
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_stalled"):
+                server.call_tool("get_desktop_state", {})
+            self.assertEqual(len(timeouts), ran, "a stalled capture runs nothing")
+            clock[0] += 31
+            self.assertEqual(server.screenshot_png(0x1234, 100), b"png")
+
     def test_valid_actions_dispatch_only_after_target_validation(self):
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli") as execute:
             for name, args in (("left_click", {"coordinate":[10, 20]}), ("type", {"text":"hello"}), ("key", {"key":"Return"}), ("scroll", {"coordinate":[10, 20], "delta_y":2})):
                 server.call_tool(name, {**args, "target_pid":4321, "target_window_id":0x1234, "expected_state_token":token})
             self.assertEqual(execute.call_count, 6)
-            self.assertEqual(execute.call_args_list[0].args, ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"))
+            self.assertEqual(execute.call_args_list[0].args, ("xdotool", "mousemove", "--window", "0x1234", "10", "20"))
             self.assertEqual(execute.call_args_list[1].args, ("xdotool", "click", "--window", "0x1234", "1"))
             self.assertEqual(execute.call_args_list[2].args[-1], "hello")
             self.assertEqual(execute.call_args_list[3].args[-1], "Return")
-            self.assertEqual(execute.call_args_list[4].args[:6], ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10"))
+            self.assertEqual(execute.call_args_list[4].args[:5], ("xdotool", "mousemove", "--window", "0x1234", "10"))
             self.assertIn("--window", execute.call_args_list[5].args)
 
     def test_visual_change_makes_screenshot_token_stale_before_input(self):
+        # The token used to hash the pixels, so a blinking caret or a clock tick made it stale before
+        # the action arrived, and every pixel action recaptured up to three times. Coordinates depend
+        # on the frame they were read from, not on what was drawn in it: a repaint keeps the token
+        # (one capture checks the window still renders), a moved or resized window makes it stale.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"new-pixels"), patch.object(server, "run_cli") as execute:
-            with self.assertRaisesRegex(server.Unsupported, "stale"):
-                server.call_tool("left_click", {"target_pid":4321, "target_window_id":0x1234,
-                                                   "expected_state_token":token, "coordinate":[10, 20]})
-            execute.assert_not_called()
+        live = [self.window]
+        args = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "coordinate": [10, 20]}
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=b"new-pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            server.call_tool("left_click", args)
+            self.assertEqual(execute.call_args.args, ("xdotool", "click", "--window", "0x1234", "1"))
+            self.assertEqual(capture.call_count, 1)
+            for frame in ([400, 20, 800, 600], [10, 20, 640, 600]):
+                live[0] = {**self.window, "geometry": frame}
+                execute.reset_mock()
+                with self.subTest(frame=frame), self.assertRaisesRegex(server.Unsupported, "stale"):
+                    server.call_tool("left_click", args)
+                execute.assert_not_called()
 
-    def test_failed_pre_input_recapture_prevents_dispatch(self):
+    def test_failed_pre_input_capture_prevents_dispatch(self):
+        # The one capture before input proves the window still renders; without it no input is sent.
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
-            server, "screenshot_png", side_effect=[b"pixels", server.Unsupported("capture failed")]
+            server, "screenshot_png", side_effect=server.Unsupported("capture failed")
         ), patch.object(server, "run_cli") as execute:
             with self.assertRaisesRegex(server.Unsupported, "capture failed"):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":0x1234,
@@ -487,7 +683,7 @@ class MCPTests(unittest.TestCase):
             for token in (None, "", "   "):
                 args = {"target_pid":4321, "target_window_id":0x1234, "text":"x"}
                 if token is not None: args["expected_state_token"] = token
-                with self.assertRaisesRegex(ValueError, "non-empty expected_state_token"):
+                with self.assertRaisesRegex(ValueError, "expected_state_token"):
                     server.call_tool("type", args)
             execute.assert_not_called()
 
@@ -498,6 +694,23 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "missing or ambiguous"):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":9, "expected_state_token":"old", "text":"x"})
             execute.assert_not_called()
+
+    def test_refusals_say_what_to_do_next(self):
+        # A bare "stale" or "missing" sent agents into repeating the same call.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "text": "x"}
+            with self.assertRaisesRegex(server.Unsupported, "stale.*Take a new screenshot"):
+                server.call_tool("type", {**base, "expected_state_token": "old"})
+            with self.assertRaisesRegex(server.Unsupported, "missing or ambiguous.*Call list_windows"):
+                server.call_tool("type", {**base, "target_window_id": 9, "expected_state_token": "old"})
+            execute.assert_not_called()
+            # Foreground delivery the window manager refused names the routes that remain.
+            execute.return_value = "99"
+            with patch.object(server.cua_native.time, "sleep"), self.assertRaisesRegex(
+                    server.Unsupported, "did not become active.*restore_window.*background delivery"):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": "foreground"})
 
     def test_bad_coordinates_and_key_input_refuse_dispatch(self):
         token = server.state_token(self.window, b"pixels")
@@ -530,11 +743,61 @@ class MCPTests(unittest.TestCase):
         with self.assertRaises(ValueError): server.install_host("bad")
 
     def test_list_windows_discards_wmctrl_hostname_column(self):
-        row = "0x01234567  0  4321  10  20  800  600  workstation.example  Editor - document.txt"
-        with patch.object(server, "run_cli", return_value=row):
+        row = "0x01234567  0  4321  10  20  800  600  editor.Editor  workstation.example  Editor - document.txt"
+        with patch.object(server, "run_cli", return_value=row) as run:
             windows = server.list_windows()
+        run.assert_called_once_with("wmctrl", "-lpGx")
         self.assertEqual(windows[0]["window_id"], 0x01234567)
         self.assertEqual(windows[0]["title"], "Editor - document.txt")
+        self.assertEqual(windows[0]["wm_class"], "editor.Editor")
+
+    def test_list_windows_filters_by_wm_class_and_reports_minimized_and_on_screen(self):
+        # bundle_id was refused outright on Linux, and nothing said a window was minimized or on
+        # another desktop, so callers screenshotted windows that had no pixels.
+        windows = [{**self.window, "wm_class": "gedit.Gedit"},
+                   {**self.window, "window_id": 0x2, "desktop": "1", "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x3, "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x4, "desktop": "-1", "wm_class": "conky.Conky"}]
+        with patch.object(server, "list_windows", side_effect=lambda: [dict(w) for w in windows]), patch.object(
+            server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"
+        ), patch.object(server, "run_cli", return_value="_NET_CURRENT_DESKTOP(CARDINAL) = 0"), patch.object(
+            server, "window_minimized", side_effect=lambda wid: wid == 0x3
+        ):
+            listed = json.loads(server.call_tool("list_windows", {})["content"][0]["text"])
+            self.assertEqual([(w["window_id"], w["is_minimized"], w["is_on_screen"]) for w in listed],
+                             [(0x1234, False, True), (0x2, False, False), (0x3, True, False), (0x4, False, True)])
+            for wanted, ids in (("Gedit", [0x1234]), ("gedit.Gedit", [0x1234]), ("app.py", [0x2, 0x3]), ("App.py", [0x2, 0x3]), ("py", [])):
+                with self.subTest(bundle_id=wanted):
+                    listed = json.loads(server.call_tool("list_windows", {"bundle_id": wanted})["content"][0]["text"])
+                    self.assertEqual([w["window_id"] for w in listed], ids)
+
+    def test_minimized_window_refuses_pixel_tools_and_says_how_to_restore_it(self):
+        # xwd of a minimized window fails with an X error that says nothing useful, and input to it is
+        # lost. Pixel tools refuse with a hint and a token restore_window accepts, which brings it back.
+        token = server.state_token(self.window, b"pixels")
+        hidden = [True]
+        def x11(*args):
+            if args[:2] == ("wmctrl", "-ia"):
+                hidden[0] = False  # activation de-iconifies, as window managers do
+            return "0x1234" if args[1] == "getwindowfocus" else ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "window_minimized", side_effect=lambda wid: hidden[0]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels") as capture, patch.object(server, "run_cli", side_effect=x11) as execute:
+            for name, args in (("screenshot", {}), ("zoom", {"region": [0, 0, 10, 10]}),
+                               ("type", {"expected_state_token": token, "text": "x"}),
+                               ("left_click", {"expected_state_token": token, "coordinate": [1, 1]})):
+                with self.subTest(name=name), self.assertRaisesRegex(server.Unsupported, "minimized.*restore_window") as refused:
+                    server.call_tool(name, {"target_pid": 4321, "target_window_id": 0x1234, **args})
+            capture.assert_not_called()
+            execute.assert_not_called()
+            restore_token = str(refused.exception).rsplit("state_token: ", 1)[1]
+            # The window manager maps the window a moment after it takes focus; xwd fails until then.
+            capture.side_effect = [server.Unsupported("xwd: BadMatch"), b"pixels"]
+            with patch.object(server.time, "sleep"):
+                restored = json.loads(server.call_tool("restore_window", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                                          "expected_state_token": restore_token})["content"][0]["text"])
+        self.assertTrue(restored["restored"])
+        self.assertEqual(execute.call_args_list[0].args, ("wmctrl", "-ia", "0x1234"))
 
 
 class NativePortTests(unittest.TestCase):
@@ -548,6 +811,8 @@ class NativePortTests(unittest.TestCase):
         self.native.CURSOR.update(enabled=False, x=0, y=0, theme="default", motion="instant")
         self.native.DISPATCH_DEPTH = 0
         self.native.VIDEO = None
+        self.native.AGENT_INPUT["at"] = float("-inf")
+        self.native.SCREENSHOTS.clear()
         environment = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         environment.start()
         self.addCleanup(environment.stop)
@@ -555,6 +820,9 @@ class NativePortTests(unittest.TestCase):
         utilities = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         utilities.start()
         self.addCleanup(utilities.stop)
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"
@@ -568,7 +836,7 @@ class NativePortTests(unittest.TestCase):
         return json.loads(server.call_tool(name, args or {})["content"][0]["text"])
 
     def test_every_native_tool_has_schema_and_description(self):
-        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value".split())
+        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value run_steps".split())
         catalog = {tool["name"]: tool for tool in server.schemas()}
         self.assertEqual(names, set(self.native.PROPERTIES))
         self.assertEqual(len(server.BASE_TOOLS), len(set(server.BASE_TOOLS)))
@@ -578,18 +846,20 @@ class NativePortTests(unittest.TestCase):
                 self.assertFalse(catalog[name]["inputSchema"]["additionalProperties"])
                 self.assertIn("session", catalog[name]["inputSchema"]["properties"])
                 self.assertNotIn("Not implemented", catalog[name]["description"])
-        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.3.2")
+        self.assertEqual(server.handle({"id": 1, "method": "initialize"})["result"]["serverInfo"]["version"], "1.4.0")
 
     def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         for name in self.native.PROPERTIES:
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                server.call_tool(name, {"unrecognized": True})
+            with self.subTest(name=name):
+                refused = server.call_tool(name, {"unrecognized": True})
+                self.assertTrue(refused["isError"])
+                self.assertIn("unknown argument: unrecognized; accepted: ", refused["content"][0]["text"])
         for name, args in (("click", {"x": True, "y": 1}),
                            ("click", {"x": 1, "y": 1, "delivery_mode": "guess"}),
                            ("click", {"x": 1, "y": 1, "button": "unknown"}),
                            ("click", {"x": 1, "y": 1, "count": 0}),
                            ("click", {"x": 1, "y": 1, "modifier": [1]}),
-                           ("set_config", {"max_image_dimension": 0}),
+                           ("set_config", {"max_image_dimension": -1}),
                            ("set_config", {"max_image_dimension": 16385}),
                            ("type_text", {"text": "bad\x00text"}),
                            ("launch_app", {"urls": "not-array"}),
@@ -608,9 +878,46 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             result = self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
         self.assertTrue(result["ok"])
+        self.assertNotIn("took_focus", result)
         self.assertEqual([call.args for call in run.call_args_list], [
-            ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
-            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
+            ("xdotool", "getactivewindow"),
+            ("xdotool", "mousemove", "--window", "0x1234", "10", "20"),
+            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+            ("xdotool", "getactivewindow")])
+
+    def test_cua_input_takes_a_screenshot_token_until_the_frame_changes_without_recapturing(self):
+        # target() recaptured the window to compare pixels, so a live window made the token stale
+        # and each action paid for a capture. The frame decides, as for the pixel tools.
+        token = server.state_token(self.window, b"pixels")
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png"
+        ) as capture, patch.object(server, "run_cli", return_value="") as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})["ok"])
+            capture.assert_not_called()
+            live[0] = {**self.window, "geometry": [10, 20, 400, 300]}
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "stale"):
+                self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})
+            run.assert_not_called()
+
+    def test_screenshot_scale_holds_only_while_the_window_keeps_its_size(self):
+        # Click pixels are read from the image the caller was given. Once the window is resized
+        # that image no longer maps onto it, and x,y are taken as window pixels again.
+        big = {**self.window, "geometry": [0, 0, 1600, 1000]}
+        live = [big]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=png(800, 500)
+        ), patch.object(server, "run_cli", return_value="") as run:
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("201", "101"))
+            with self.assertRaises(ValueError):
+                self.value("click", {"window_id": 0x1234, "x": 800, "y": 0})
+            live[0] = {**big, "geometry": [0, 0, 1200, 900]}
+            run.reset_mock()
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("100", "50"))
 
     def test_click_foreground_activates_clicks_and_restores(self):
         def cli(*args):
@@ -625,6 +932,39 @@ class NativePortTests(unittest.TestCase):
         self.assertIn(("xdotool", "click", "--repeat", "2", "--delay", "100", "1"), calls)
         self.assertEqual(calls[-1], ("wmctrl", "-ia", "0x63"))
 
+    def test_focus_is_handed_back_only_while_the_target_holds_it_and_the_user_is_elsewhere(self):
+        # Background input must leave the user's window in front: some apps raise themselves when a
+        # control is pressed. Foreground delivery hands the front back afterwards. Neither may pull
+        # the user away from a window they went to themselves.
+        def run_click(delivery, after_input, user_on_target=False):
+            front = ["99"]
+            def cli(*args):
+                if args[1] == "getactivewindow":
+                    return front[0]
+                if args[:2] == ("wmctrl", "-ia"):
+                    front[0] = str(int(args[2], 16))
+                if args[1] == "click":
+                    front[0] = after_input
+                return ""
+            with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+                server, "run_cli", side_effect=cli
+            ) as run, patch.object(self.native, "user_on", return_value=user_on_target):
+                result = self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": delivery})
+            return result, ("wmctrl", "-ia", "0x63") in [call.args for call in run.call_args_list]
+        result, returned = run_click("background", after_input="4660")
+        self.assertTrue(returned)
+        self.assertEqual((result["took_focus"], result["focus_returned"]), (True, True))
+        for delivery, after_input, user_on_target, expected in (
+                ("background", "99", False, False),     # nothing moved
+                ("background", "4660", True, False),    # the user went to the target
+                ("foreground", "4660", False, True),    # temporary activation is undone
+                ("foreground", "777", False, False),    # the user moved on to another window
+                ("foreground", "4660", True, False)):   # the user is on the target now
+            with self.subTest(delivery=delivery, after_input=after_input, user_on_target=user_on_target):
+                result, returned = run_click(delivery, after_input, user_on_target)
+                self.assertEqual(returned, expected)
+                self.assertNotIn("took_focus", result)
+
     def test_foreground_ignores_windowactivate_failure_when_wmctrl_activates(self):
         def cli(*args):
             if args[1] == "getactivewindow":
@@ -636,7 +976,9 @@ class NativePortTests(unittest.TestCase):
             self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
         self.assertNotIn(("xdotool", "windowactivate", "0x1234"), [call.args for call in run.call_args_list])
 
-    def test_foreground_activation_failure_restores_focus(self):
+    def test_foreground_activation_failure_leaves_focus_where_it_is(self):
+        # The target never came to the front, so there is nothing to hand back; reactivating the
+        # previous window anyway could pull the user back from wherever they went.
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "99"
@@ -646,7 +988,7 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
             with self.assertRaisesRegex(server.Unsupported, "foreground activation failed: target window did not become active"):
                 self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
-        self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+        self.assertNotIn(("wmctrl", "-ia", "0x63"), [call.args for call in run.call_args_list])
 
     def test_foreground_restores_focus_on_input_failure(self):
         def cli(*args):
@@ -671,9 +1013,9 @@ class NativePortTests(unittest.TestCase):
     def test_keyboard_background_and_foreground_arguments(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             self.value("type_text", {"window_id": 0x1234, "text": "hello"})
-            self.assertEqual(run.call_args.args, ("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello"))
+            self.assertEqual(sent(run, "type"), [("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello")])
             self.value("hotkey", {"window_id": 0x1234, "keys": ["ctrl", "c"]})
-            self.assertEqual(run.call_args.args, ("xdotool", "key", "--window", "0x1234", "ctrl+c"))
+            self.assertEqual(sent(run, "key"), [("xdotool", "key", "--window", "0x1234", "ctrl+c")])
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
@@ -684,15 +1026,15 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
 
     def test_right_click_and_modifier_cleanup(self):
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run:
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="") as run:
             self.value("right_click", {"window_id": 0x1234, "x": 0, "y": 0, "modifier": ["shift"]})
-        calls = [call.args for call in run.call_args_list]
+        calls = [call.args for call in run.call_args_list if call.args[1] != "getactivewindow"]
         self.assertEqual(calls[0], ("xdotool", "keydown", "--window", "0x1234", "shift"))
         self.assertEqual(calls[-2][-1], "3")
         self.assertEqual(calls[-1], ("xdotool", "keyup", "--window", "0x1234", "shift"))
 
     def test_recording_creates_evidence_before_and_after_each_mutation(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
             self.value("start_recording", {"output_dir": directory})
             self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
             turn = Path(directory) / "turn-00001"
@@ -774,7 +1116,7 @@ class NativePortTests(unittest.TestCase):
             turn = Path(source) / "turn-00001"
             turn.mkdir()
             (turn / "action.json").write_text(json.dumps({"name": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}}))
-            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
                 self.value("start_recording", {"output_dir": destination})
                 self.assertTrue(self.value("replay_trajectory", {"dir": source, "delay_ms": 0})["ok"])
                 self.assertTrue((Path(destination) / "turn-00001/action.json").exists())
@@ -786,7 +1128,10 @@ class NativePortTests(unittest.TestCase):
 
     def test_config_round_trip_and_invalid_values_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "CONFIG_PATH", Path(directory) / "config.json"), patch.object(self.native, "human_guard"):
-            self.assertEqual(self.value("get_config")["max_image_dimension"], 1920)
+            # 1366 by default: clients resize larger images by an amount the caller cannot know.
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 1366)
+            self.value("set_config", {"max_image_dimension": 0})
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 0, "0 keeps the native frame")
             self.value("set_config", {"max_image_dimension": 1024})
             self.assertEqual(self.value("get_config"), {"max_image_dimension": 1024, "allow_without_activity_check": False})
             with self.assertRaises(ValueError):
@@ -817,6 +1162,116 @@ class NativePortTests(unittest.TestCase):
         outputs = ["100", "X=10\nY=20\nWINDOW=99\n", "99"]
         with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=outputs):
             self.native.human_guard(server, {"window_id": 0x1234})
+
+    def test_agents_own_xtest_input_is_not_taken_for_the_user(self):
+        # xdotool moves the pointer with XTest, which resets the X idle timer just as a person does,
+        # and leaves the pointer on the target: the guard before the click then refused every
+        # background click the agent made. Input this server sent is not the user's.
+        last_input = [self.native.time.monotonic() - 10]
+        def x11(*args):
+            if args[0] == "xprintidle":
+                return str(int((self.native.time.monotonic() - last_input[0]) * 1000))
+            if args[1] == "getmouselocation":
+                return "X=20\nY=40\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            if args[1] in ("mousemove", "click"):
+                last_input[0] = self.native.time.monotonic()
+            return ""
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", side_effect=x11) as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})["ok"])
+            self.assertIn(("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+                          [call.args for call in run.call_args_list])
+            # The user moved over the target after the agent's last input: that is still a person.
+            self.native.AGENT_INPUT["at"] = self.native.time.monotonic() - 1
+            last_input[0] = self.native.time.monotonic()
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
+            self.assertFalse([call for call in run.call_args_list if call.args[1:2] in (("mousemove",), ("click",))])
+
+    def test_escalation_acts_while_the_user_is_on_the_target_and_the_refusal_says_how(self):
+        # Stealth is the default, but a refusal must not be a dead end: when no quiet route exists
+        # the caller retries the same call with allow_while_user_active.
+        def cli(*args):
+            if args[0] == "xprintidle":
+                return "100"
+            if args[1] == "getmouselocation":
+                return "X=10\nY=20\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            return ""
+        def user_moves():
+            # The user's last input (100 ms ago) came after anything the agent sent.
+            self.native.AGENT_INPUT["at"] = float("-inf")
+        token = server.state_token(self.window, b"pixels")
+        legacy = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "text": "hi"}
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli", side_effect=cli) as run:
+            for name, args, verb in (("click", {"window_id": 0x1234, "x": 1, "y": 2}, "click"), ("type", legacy, "type")):
+                with self.subTest(name=name):
+                    user_moves()
+                    with self.assertRaises(server.Unsupported) as refused:
+                        server.call_tool(name, args)
+                    self.assertIn("allow_while_user_active", str(refused.exception))
+                    self.assertEqual(sent(run, verb), [])
+                    self.assertFalse(server.call_tool(name, {**args, "allow_while_user_active": True})["isError"])
+                    self.assertEqual(len(sent(run, verb)), 1)
+            with self.assertRaises(ValueError):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": "yes"})
+            # Escalating a replay does not escalate what it replays: a recorded escalation was for that moment.
+            with tempfile.TemporaryDirectory() as source:
+                (Path(source) / "turn-00001").mkdir()
+                (Path(source) / "turn-00001/action.json").write_text(json.dumps({"name": "click", "arguments": {
+                    "window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": True}}))
+                user_moves()
+                replay = self.value("replay_trajectory", {"dir": source, "allow_while_user_active": True})
+            self.assertFalse(replay["ok"])
+            self.assertIn("human_activity", replay["results"][0]["content"][0]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
+
+    def test_run_steps_stops_at_the_first_failure_and_looks_once(self):
+        # Acting and looking used to be separate round trips with the window free to change between them.
+        steps = [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                 {"tool": "type_text", "arguments": {"window_id": 0x1234, "text": "Ada"}}]
+        observe = {"target_pid": 4321, "target_window_id": 0x1234}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(800, 600)
+        ), patch.object(server, "run_cli", return_value="") as run:
+            done = server.call_tool("run_steps", {"steps": steps, "observe": observe})
+            self.assertFalse(done["isError"])
+            output = json.loads(done["content"][0]["text"])
+            self.assertEqual((output["completed"], [item["tool"] for item in output["results"]]), (2, ["click", "type_text"]))
+            self.assertEqual(done["content"][1]["type"], "image")
+            self.assertIn("state_token", json.loads(done["content"][2]["text"]))
+            run.reset_mock()
+            # Nothing after the failed step may run.
+            stopped = server.call_tool("run_steps", {"steps": [steps[0], {"tool": "screenshot", "arguments": {**observe, "width": 900}}, steps[0]]})
+            self.assertTrue(stopped["isError"])
+            halted = json.loads(stopped["content"][0]["text"])
+            self.assertEqual((halted["failed_step"], len(halted["results"])), (1, 2))
+            self.assertIn("unknown argument: width", halted["results"][1]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
+            # A step cannot start another loop of its own.
+            for nested in ("run_steps", "replay_trajectory", "no_such_tool"):
+                with self.subTest(nested=nested):
+                    self.assertTrue(server.call_tool("run_steps", {"steps": [{"tool": nested, "arguments": {}}]})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("run_steps", {"steps": []})
+
+    def test_run_steps_records_each_step_as_its_own_turn(self):
+        # A recording of run_steps must replay its steps, not one opaque call that replay refuses.
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", return_value=""):
+            self.value("start_recording", {"output_dir": directory})
+            server.call_tool("run_steps", {"steps": [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                                                     {"tool": "press_key", "arguments": {"window_id": 0x1234, "key": "Return"}}]})
+            turns = sorted(Path(directory).glob("turn-*"))
+            self.assertEqual([json.loads((turn / "action.json").read_text())["name"] for turn in turns], ["click", "press_key"])
 
     def test_health_reports_missing_idle_check(self):
         with patch.object(server.shutil, "which", return_value=None):
@@ -869,11 +1324,11 @@ class NativePortTests(unittest.TestCase):
             result = server.call_tool("get_desktop_state", {})
             self.assertEqual(result["content"][0]["type"], "image")
             self.assertEqual(run.call_args_list[0].args, ("xwd", "-silent", "-root"))
-            self.assertIn("1920x1920>", run.call_args_list[1].args)
+            self.assertIn("1366x1366>", run.call_args_list[1].args)
 
     def test_clipboard_binary_requires_png_and_xclip(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None):
-            path = Path(directory) / "image.png"
+            path = Path(directory).resolve() / "image.png"
             path.write_bytes(b"not png")
             with self.assertRaisesRegex(ValueError, "PNG"):
                 self.value("clipboard_write", {"image_path": str(path)})
@@ -912,10 +1367,34 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(popen.call_args.args[0], ["/usr/bin/xclip", "-selection", "clipboard", "-t", "text/plain;charset=utf-8", "-i"])
             self.assertEqual(popen.return_value.communicate.call_args.args, (b"hello",))
             with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "a b.txt"
+                path = Path(directory).resolve() / "a b.txt"
                 path.write_text("file")
                 self.assertEqual(self.value("clipboard_write", {"file_path": str(path)})["mime_type"], "text/uri-list")
                 self.assertEqual(popen.return_value.communicate.call_args.args, ((path.resolve().as_uri() + "\r\n").encode(),))
+
+    def test_clipboard_write_refuses_relative_and_symlinked_paths(self):
+        # A relative path depends on the server's working directory and a symlink can point at a file
+        # the caller never named; either way the clipboard would carry something else.
+        with tempfile.TemporaryDirectory() as raw, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.returncode = 0
+            directory = Path(raw).resolve()
+            (directory / "file").write_text("hello")
+            (directory / "link").symlink_to(directory / "file")
+            (directory / "parent").symlink_to(directory)
+            for path in ("file", "~/file", str(directory / "link"), str(directory / "parent" / "file")):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    self.value("clipboard_write", {"file_path": path})
+            popen.assert_not_called()
+            self.assertEqual(self.value("clipboard_write", {"file_path": str(directory / "file")})["mime_type"], "text/uri-list")
+
+    def test_clipboard_text_is_read_only_when_asked(self):
+        # Clipboard text is often private (a password just copied); listing the clipboard must not leak it.
+        with patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(
+            server, "run_cli_bytes", return_value=b"secret"
+        ) as read:
+            self.assertEqual(self.value("clipboard_read"), {"text": None})
+            read.assert_not_called()
+            self.assertEqual(self.value("clipboard_read", {"include_text": True}), {"text": "secret"})
 
     def test_optional_video_uses_x11grab_and_stops_owned_process(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None), patch.object(server.subprocess, "Popen") as popen:
@@ -942,9 +1421,10 @@ class NativePortTests(unittest.TestCase):
         atspi.get_desktop.return_value = desktop
         editable = node.get_editable_text_iface.return_value
         editable.set_text_contents.return_value = True
-        text = node.get_text_iface.return_value
+        # Readback goes through Atspi.Text.get_text(node, ...): the interface object's own get_text is the
+        # deprecated one-argument Accessible.get_text and failed every readback on real AT-SPI.
         for observed, succeeds in [(["", "hello"], True), ([""] * 15, False)]:
-            text.get_text.side_effect = observed
+            atspi.Text.get_text.side_effect = observed
             editable.set_text_contents.reset_mock()
             with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
                 server, "list_windows", return_value=[self.window]
@@ -974,7 +1454,7 @@ class NativePortTests(unittest.TestCase):
     def test_human_activity_between_click_commands_stops_before_click(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server.cua_native, "human_guard", side_effect=[None, None, server.Unsupported("human_activity")]
-        ), patch.object(server, "run_cli") as cli:
+        ), patch.object(server, "run_cli", return_value="") as cli:
             with self.assertRaisesRegex(server.Unsupported, "human_activity"):
                 self.value("click", {"window_id": self.window["window_id"], "x": 10, "y": 20})
             self.assertFalse(any(c.args[:2] == ("xdotool", "click") for c in cli.call_args_list))
@@ -1010,6 +1490,230 @@ class BrowserPortTests(unittest.TestCase):
                 request.assert_called_once_with(name, arguments)
                 self.assertTrue(tools[name]["inputSchema"]["properties"])
                 self.assertNotIn("separately registered", tools[name]["description"])
+
+    def test_every_page_tool_lets_the_caller_escalate_and_the_flag_reaches_the_extension(self):
+        # The extension refuses a tab the user selected unless the call carries allow_while_user_active.
+        # The schemas forbid unknown properties, so a tool without it could never escalate; and only
+        # the extension can tell whether the user is on the tab, so the server must pass it through.
+        tools = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}
+        for name in server.BROWSER_PAGE_TOOLS:
+            with self.subTest(name=name):
+                self.assertEqual(tools[name]["properties"]["allow_while_user_active"]["type"], "boolean")
+                self.assertFalse(tools[name]["additionalProperties"])
+        # A dialog in a tab the user selected is theirs; open, close and status act on no page.
+        others = {"browser_dialog", "browser_open", "browser_close", "browser_status"}
+        for name in others:
+            self.assertNotIn("allow_while_user_active", tools[name]["properties"])
+        # A new browser tool has to be classified one way or the other.
+        self.assertEqual(set(server.BROWSER_PAGE_TOOLS) | others,
+                         {name for name in server.BASE_TOOLS if name.startswith("browser_") or name == "page"})
+        with patch.object(server, "browser_request", return_value={"url": "https://example.com/"}) as request:
+            server.call_tool("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+        request.assert_called_once_with("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+
+    def test_snapshot_query_is_accepted_and_forwarded(self):
+        # A long page buries the one control a task needs past the 200-element cap; query is how the
+        # caller reaches it, so the schema must admit it and the server must forward it unchanged.
+        schema = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}["browser_snapshot"]
+        self.assertEqual(schema["properties"]["query"]["type"], "string")
+        with patch.object(server, "browser_request", return_value={"elements": []}) as request:
+            server.call_tool("browser_snapshot", {"query": "delete app"})
+        request.assert_called_once_with("browser_snapshot", {"query": "delete app"})
+
+    def test_extension_status_names_every_state_and_never_raises(self):
+        # browser_status is the agent's first browser call. Each state means a different next step
+        # (use the tools, retry, reload, reconnect, install), so none may be mistaken for another,
+        # and a status question must get a status answer rather than an error.
+        current = {"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": "1.5.0"}
+        cases = [
+            ({"return_value": current}, "a" * 32, "connected"),
+            # Versions compare by number: 1.10.0 is newer than 1.5.0 although it sorts first as text.
+            ({"return_value": {**current, "version": "1.10.0"}}, "a" * 32, "connected"),
+            ({"return_value": {**current, "version": "1.3.1"}}, "a" * 32, "outdated"),
+            ({"return_value": {key: value for key, value in current.items() if key != "version"}}, "a" * 32, "outdated"),
+            ({"side_effect": server.BridgeTimeout("timed out")}, "a" * 32, "busy"),
+            ({"side_effect": server.Unsupported("not connected")}, "a" * 32, "not_connected"),
+            ({"side_effect": server.Unsupported("not connected")}, None, "not_installed"),
+            ({"side_effect": RuntimeError("unexpected")}, "a" * 32, "not_connected"),
+        ]
+        for request, registered, state in cases:
+            with self.subTest(state=state, request=request), patch.object(server, "browser_request", **request), patch.object(
+                server, "installed_extension_id", return_value=registered
+            ):
+                status = server.extension_status()
+            self.assertEqual(status["state"], state)
+            self.assertEqual(status["connected"], state in ("connected", "outdated", "busy"))
+            self.assertEqual("hint" in status, state != "connected")
+
+    def test_browser_status_answers_with_a_state_when_the_bridge_is_down(self):
+        # With Chrome closed there is no bridge socket; the tool must still answer, not fail, and say why.
+        with tempfile.TemporaryDirectory() as home, patch.object(server, "BRIDGE_PATH", Path(home) / "bridge.sock"), patch.object(
+            server, "chrome_running", return_value=False
+        ):
+            server.install_host("a" * 32, home)
+            with patch.object(server.Path, "home", return_value=Path(home)):
+                result = server.call_tool("browser_status", {})
+        status = json.loads(result["content"][0]["text"])
+        self.assertFalse(result["isError"])
+        self.assertEqual(status["state"], "not_connected")
+        self.assertTrue(status["hint"])
+
+    def test_bridge_waits_out_an_extension_reconnect_but_not_a_closed_chrome(self):
+        # The extension reconnects about a second after a drop, so a call made in that gap should land
+        # instead of failing. With Chrome closed nothing will reconnect, so fail at once and say why.
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with patch.object(server, "chrome_running", return_value=False):
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "Chrome is not running"):
+                    server.browser_request("browser_snapshot", {})
+                self.assertLess(time.monotonic() - start, 0.5)
+
+            def reconnect_then_answer():
+                time.sleep(0.3)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.bind(str(server.BRIDGE_PATH))
+                    listener.listen(1)
+                    client, _ = listener.accept()
+                    with client:
+                        request = server._read_frame(client.makefile("rb"))
+                        server._write_frame(client.makefile("wb"), {"id": request["id"], "ok": True, "url": "https://example.com/"})
+                server.BRIDGE_PATH.unlink()
+
+            extension = threading.Thread(target=reconnect_then_answer)
+            extension.start()
+            with patch.object(server, "chrome_running", return_value=True):
+                self.assertEqual(server.browser_request("browser_snapshot", {}), {"url": "https://example.com/"})
+                extension.join()
+                # Chrome is up but the extension never comes back: give up after the wait, with the reconnect hint.
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "extension is not connected. It reconnects"):
+                    server.browser_request("browser_snapshot", {}, timeout=1)
+                self.assertGreaterEqual(time.monotonic() - start, 0.5)
+
+    def test_bridge_failures_say_which_failure_happened(self):
+        # A closed bridge means "check browser_status and retry"; a timeout means the action may have
+        # run, so "check the tab before retrying". The caller can only choose if the messages differ.
+        def bridge():
+            server.BRIDGE_PATH.unlink(missing_ok=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(server.BRIDGE_PATH))
+            listener.listen(1)
+            return listener
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with bridge():
+                with self.assertRaisesRegex(server.BridgeTimeout, "timed out. Check the tab"):
+                    server.browser_request("browser_snapshot", {}, timeout=0.3)
+            with bridge() as listener:
+                closing = threading.Thread(target=lambda: listener.accept()[0].close())
+                closing.start()
+                with self.assertRaisesRegex(server.Unsupported, "stopped answering") as caught:
+                    server.browser_request("browser_snapshot", {}, timeout=2)
+                closing.join()
+                self.assertNotIsInstance(caught.exception, server.BridgeTimeout)
+
+    def test_native_host_tells_the_caller_when_the_extension_never_answers(self):
+        # A page Chrome froze kept the extension from answering; the host waited forever and every
+        # later call hung behind it. Now the caller hears why, and the host exits so Chrome starts a
+        # clean one when the extension reconnects.
+        origin = "chrome-extension://" + "a" * 32 + "/"
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        with contextlib.ExitStack() as stack:
+            for fd in (stdin_r, stdin_w, stdout_r, stdout_w):
+                stack.callback(os.close, fd)
+            bridge = Path(stack.enter_context(tempfile.TemporaryDirectory())) / "bridge.sock"
+            chrome_reads = stack.enter_context(open(stdout_r, "rb", closefd=False))
+            host_stdin = stack.enter_context(open(stdin_r, "rb", closefd=False))
+            host_stdout = stack.enter_context(open(stdout_w, "wb", closefd=False))
+            for target, name, value in ((server, "BRIDGE_PATH", bridge), (server, "installed_extension_id", lambda: "a" * 32),
+                                        (server.sys, "argv", ["server.py", "chrome-native-host", origin]),
+                                        (server.sys, "stdin", host_stdin), (server.sys, "stdout", SimpleNamespace(buffer=host_stdout))):
+                stack.enter_context(patch.object(target, name, value))
+            host = threading.Thread(target=server.native_host, kwargs={"response_timeout": 0.3}, daemon=True)
+            host.start()
+            deadline = time.monotonic() + 2
+            while not bridge.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as caller:
+                caller.settimeout(5)  # a host without its deadline fails this test instead of hanging it
+                caller.connect(str(bridge))
+                with caller.makefile("wb") as writer:
+                    server._write_frame(writer, {"id": "r1", "operation": "browser_snapshot"})
+                with caller.makefile("rb") as reader:
+                    answer = server._read_frame(reader)
+            host.join(2)
+            self.assertEqual(server._read_frame(chrome_reads)["id"], "r1")
+        self.assertEqual(answer["id"], "r1")
+        self.assertIs(answer["ok"], False)
+        self.assertIn("did not answer", answer["error"])
+        self.assertFalse(host.is_alive())
+        self.assertFalse(bridge.exists())
+
+    def test_native_host_serves_only_the_registered_extension(self):
+        # The host is a plain script anyone can start with any origin argument; only the extension
+        # install_host registered may open the bridge into the user's Chrome profile.
+        for registered, origin in (("a" * 32, "chrome-extension://" + "b" * 32 + "/"), (None, "chrome-extension://" + "a" * 32 + "/")):
+            with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory, open(os.devnull, "rb") as stdin, patch.object(
+                server, "BRIDGE_PATH", Path(directory) / "bridge.sock"
+            ), patch.object(server, "installed_extension_id", return_value=registered), patch.object(
+                server.sys, "argv", ["server.py", "chrome-native-host", origin]
+            ), patch.object(server.sys, "stdin", stdin):
+                server.native_host()
+                self.assertFalse(server.BRIDGE_PATH.with_suffix(".lock").exists())
+
+    def test_client_exit_closes_the_agents_tab_only_when_the_bridge_is_up(self):
+        # An agent that never reached browser_close would leave its tab, and Chrome's debugging bar,
+        # open for good. With no bridge there is no tab to close, and exit must not wait on a reconnect.
+        for available in (True, False):
+            with self.subTest(available=available), patch.object(server, "browser_bridge_available", return_value=available), patch.object(
+                server, "browser_request", side_effect=server.Unsupported("tab already gone")
+            ) as request, patch.object(server.sys, "argv", ["server.py"]), patch.object(server.sys, "stdin", io.StringIO("")):
+                server.main()  # a failed close must not turn a clean exit into a crash
+            if available:
+                request.assert_called_once_with("browser_close", {})
+            else:
+                request.assert_not_called()
+
+    def test_screenshot_of_chrome_points_at_the_browser_tools(self):
+        # Web content answers DOM refs in a background tab far better than pixel clicks in the user's
+        # Chrome window, so a caller looking at Chrome should learn the extension is there to use.
+        for name, available, expected in (("chrome", True, True), ("chrome", False, False), ("gedit", True, False)):
+            with self.subTest(name=name, available=available), patch.object(server, "process_name", return_value=name), patch.object(
+                server, "browser_bridge_available", return_value=available
+            ):
+                self.assertEqual(server.browser_tools_hint(4321) is not None, expected)
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"png"), patch.object(
+            server, "process_name", return_value="chrome"
+        ), patch.object(server, "browser_bridge_available", return_value=True):
+            content = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})["content"]
+        self.assertEqual(content[0]["type"], "image")
+        self.assertIn("browser_open", content[-1]["text"])
+
+    def test_installed_extension_id_reads_what_install_host_registered(self):
+        # The native host trusts only this origin and browser_status says not_installed without it,
+        # so it must read exactly what install_host writes and reject anything else.
+        with tempfile.TemporaryDirectory() as home:
+            self.assertIsNone(server.installed_extension_id(home))
+            server.install_host("b" * 32, home)
+            self.assertEqual(server.installed_extension_id(home), "b" * 32)
+            origin = "chrome-extension://{}/".format
+            for broken in ("not json", "[]", json.dumps({"allowed_origins": [origin("b" * 32), origin("c" * 32)]}),
+                           json.dumps({"allowed_origins": [origin("z" * 32)]})):
+                server.host_registration(home).write_text(broken)
+                self.assertIsNone(server.installed_extension_id(home))
+
+    def test_doctor_and_health_report_include_the_extension_state(self):
+        # Diagnostics are where a user looks when browser tools are missing; they must say which state.
+        with patch.object(server, "browser_bridge_available", return_value=False), patch.object(
+            server, "installed_extension_id", return_value=None
+        ):
+            doctor = json.loads(server.call_tool("doctor", {})["content"][0]["text"])
+        self.assertEqual(doctor["chrome_extension"]["state"], "not_installed")
+        self.assertEqual(doctor["supported_browser_tools"], [])
+        with patch.object(server, "extension_status", return_value={"connected": True, "state": "busy", "hint": "retry"}):
+            health = json.loads(server.call_tool("health_report", {})["content"][0]["text"])
+        self.assertEqual(health["chrome_extension"]["state"], "busy")
 
     def test_download_moves_completed_file_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(server.Path, "home", return_value=Path(folder)):
@@ -1124,6 +1828,8 @@ class BrowserPortTests(unittest.TestCase):
         field.get_text.assert_not_called()
         with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
             server, "list_windows", return_value=[self.window]
+        ), patch.object(server.atspi_tree, "snapshot", side_effect=server.Unsupported("no AT-SPI tree")), patch.object(
+            server, "decision_image", return_value=(None, "capture_unavailable")
         ), patch.object(server, "jev_route", return_value=True), patch.object(
             server, "jev_evaluate", return_value={"answers": {"criterion_0": {"noul": 0.9}}}
         ) as evaluate:
@@ -1152,3 +1858,385 @@ class BrowserPortTests(unittest.TestCase):
 
 
 if __name__ == "__main__": unittest.main()
+
+
+class DecisionRoutingTests(unittest.TestCase):
+    """d1.2-ultra answers every decision; Jev answers only when d1.2-ultra cannot be reached."""
+
+    request = {"state": {"goal": "Click Save"}, "questions": {"q": {"type": "noul", "instructions": "?"}}}
+    answered = {"answers": {"q": {"type": "noul", "noul": 0.9}}}
+
+    def scripted(self, replies):
+        calls = []
+
+        class Response:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, limit):
+                return json.dumps(self.body).encode()[:limit]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            body = json.loads(request.data)
+            calls.append({"model": body["model"], "body": body, "timeout": timeout,
+                          "auth": request.get_header("Authorization"), "url": request.full_url})
+            reply = replies.get(body["model"], 500)
+            if isinstance(reply, BaseException):
+                raise reply
+            if isinstance(reply, int):
+                raise server.urllib.error.HTTPError(request.full_url, reply, "status", {}, None)
+            return Response(reply)
+
+        return calls, patch.object(server.urllib.request, "urlopen", side_effect=urlopen)
+
+    def test_openrouter_key_always_routes_to_d12_ultra_with_jev_fallback(self):
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key", "TYPESAFE_API_KEY": "ts-key"}, clear=True):
+            # The owner chose OpenRouter for every decision, so a Jev key beside it must not win.
+            self.assertEqual(server.jev_route(), ("or-key", "https://openrouter.ai/api/alpha/decisions",
+                                                  "liquid/d1.2-ultra", "typesafe/jev-1.14"))
+        with patch.dict(os.environ, {"JEV_API_KEY": "jev-key", "TYPESAFE_API_KEY": "ts-key"}, clear=True):
+            self.assertEqual(server.jev_route(), ("jev-key", "https://api.typesafe.ai/v1/systemone", "jev-latest", None))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(server.jev_route())
+
+    def test_d12_ultra_answers_and_names_the_model_that_served_it(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": dict(self.answered, model="liquid/d1.2-ultra-20261116")})
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            response = server.jev_evaluate(dict(self.request))
+        self.assertEqual(response["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertNotIn("fallback_reason", response)
+        self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra"])
+        self.assertEqual(calls[0]["auth"], "Bearer or-key")
+        # A short primary timeout leaves time for Jev when d1.2-ultra hangs.
+        self.assertEqual(calls[0]["timeout"], 5)
+
+    def test_unreachable_d12_ultra_falls_back_to_jev_and_says_why(self):
+        for failure in (503, 429, 404, TimeoutError("slow"), server.URLError(ConnectionRefusedError())):
+            with self.subTest(failure=failure):
+                calls, urlopen = self.scripted({"liquid/d1.2-ultra": failure, "typesafe/jev-1.14": self.answered})
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+                    response = server.jev_evaluate(dict(self.request))
+                self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra", "typesafe/jev-1.14"])
+                self.assertEqual(response["engine"], "typesafe/jev-1.14")
+                self.assertTrue(response["fallback_reason"].startswith("liquid/d1.2-ultra "), response["fallback_reason"])
+                self.assertEqual(response["answers"]["q"]["noul"], 0.9)
+
+    def test_rejected_request_fails_loud_instead_of_hiding_the_bug_behind_jev(self):
+        for status in (400, 401, 402, 422):
+            with self.subTest(status=status):
+                calls, urlopen = self.scripted({"liquid/d1.2-ultra": status, "typesafe/jev-1.14": self.answered})
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+                    with self.assertRaisesRegex(server.Unsupported, f"HTTP {status}"):
+                        server.jev_evaluate(dict(self.request))
+                self.assertEqual([call["model"] for call in calls], ["liquid/d1.2-ultra"])
+
+    def test_both_models_down_is_an_error_naming_both(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": 503, "typesafe/jev-1.14": 502})
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            with self.assertRaises(server.Unsupported) as raised:
+                server.jev_evaluate(dict(self.request))
+        self.assertIn("liquid/d1.2-ultra HTTP 503", str(raised.exception))
+        self.assertIn("typesafe/jev-1.14 HTTP 502", str(raised.exception))
+
+    def test_direct_jev_route_has_no_fallback(self):
+        calls, urlopen = self.scripted({"jev-latest": 503})
+        with patch.dict(os.environ, {"JEV_API_KEY": "jev-key"}, clear=True), urlopen:
+            with self.assertRaises(server.Unsupported):
+                server.jev_evaluate(dict(self.request))
+        self.assertEqual([(call["model"], call["timeout"]) for call in calls], [("jev-latest", 12)])
+
+    def test_image_request_keeps_its_image_on_fallback_and_gets_a_longer_timeout(self):
+        calls, urlopen = self.scripted({"liquid/d1.2-ultra": 503, "typesafe/jev-1.14": self.answered})
+        state = server.state_with_image({"goal": "Click Save"}, "data:image/png;base64,AAAA")
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "or-key"}, clear=True), urlopen:
+            server.jev_evaluate({"state": state, "questions": self.request["questions"]})
+        self.assertEqual(calls[0]["timeout"], 10)
+        # Jev on OpenRouter reads images up to 1024 px, so the fallback decides from the same evidence.
+        for call in calls:
+            image, text = call["body"]["state"]
+            self.assertEqual(image, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+            self.assertIn("Click Save", text)
+
+
+class AtspiTreeTests(unittest.TestCase):
+    """The AT-SPI layer: ids that keep meaning their element, secure fields never read, decisions over it."""
+
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def setUp(self):
+        server.atspi_tree.STORE.clear()
+
+    @staticmethod
+    def item(index, role, name="", parent=None, states=(), actions=(), value=None, depth=0):
+        accessible = type("Accessible", (), {})()
+        accessible.get_role_name = lambda: role
+        accessible.get_name = lambda: name
+        accessible.get_description = lambda: ""
+        return {"id": f"ax_{index}", "role": role, "name": name, "description": "", "value": value,
+                "states": list(states), "actions": list(actions), "depth": depth, "parent": parent, "accessible": accessible}
+
+    def form(self):
+        return [self.item(0, "frame", "Form"), self.item(1, "filler", parent="ax_0"),
+                self.item(2, "label", "Status: Ready", parent="ax_1"), self.item(3, "filler", parent="ax_1"),
+                self.item(4, "label", "Wi-Fi", parent="ax_3"), self.item(5, "toggle button", parent="ax_3", states=["checked"], actions=["toggle"]),
+                self.item(6, "button", "Save", parent="ax_1", actions=["click"]),
+                self.item(7, "button", "Delete draft", parent="ax_1", actions=["click"])]
+
+    def test_rows_fold_unnamed_wrappers_and_a_query_keeps_ancestors(self):
+        rows = server.atspi_tree.render_rows(self.form())
+        # A single-child wrapper says nothing; folding it keeps the tree short for the model reading it.
+        self.assertEqual(rows.splitlines()[:3], ['- [ax_0] frame "Form"', "  - [ax_1] filler", '    - [ax_2] label "Status: Ready"'])
+        self.assertIn('- [ax_5] toggle button {checked} [toggle]', rows)
+        query = server.atspi_tree.render_rows(self.form(), query="save|status")
+        self.assertEqual(query.splitlines(), ['- [ax_0] frame "Form"', "  - [ax_1] filler",
+                                              '    - [ax_2] label "Status: Ready"', '    - [ax_6] button "Save" [click]'])
+        capped = server.atspi_tree.render_rows(self.form(), max_elements=2)
+        self.assertIn("more rows", capped.splitlines()[-1])
+
+    def test_an_id_keeps_meaning_its_element_until_it_changes(self):
+        nodes = self.form()
+        token = server.atspi_tree.remember(self.window, nodes)
+        self.assertIs(server.atspi_tree.resolve(server, self.window, "ax_6", token), nodes[6]["accessible"])
+        nodes[6]["accessible"].get_name = lambda: "Send"  # Same slot, different control: never press it.
+        with self.assertRaisesRegex(server.Unsupported, "stale_state_token"):
+            server.atspi_tree.resolve(server, self.window, "ax_6", token)
+        with self.assertRaisesRegex(server.Unsupported, "not in that read"):
+            server.atspi_tree.resolve(server, self.window, "ax_99", token)
+
+    def test_only_the_last_eight_reads_are_kept(self):
+        tokens = [server.atspi_tree.remember(self.window, self.form()) for _ in range(9)]
+        with self.assertRaisesRegex(server.Unsupported, "stale_state_token"):
+            server.atspi_tree.resolve(server, self.window, "ax_6", tokens[0])
+        server.atspi_tree.resolve(server, self.window, "ax_6", tokens[-1])
+
+    def test_a_secure_field_is_never_read(self):
+        atspi = type("Atspi", (), {})()
+        node = type("Node", (), {"get_text_iface": lambda self: self})()
+        atspi.Text = type("Text", (), {"get_character_count": staticmethod(lambda node: 7),
+                                         "get_text": staticmethod(lambda node, start, end: "hunter2")})
+        self.assertIsNone(server.atspi_tree._value(atspi, node, "password text"))
+        self.assertEqual(server.atspi_tree._value(atspi, node, "text"), "hunter2")
+
+    def test_switch_without_a_name_is_labelled_by_the_text_beside_it(self):
+        labels = {item["id"]: label for item, label in server.atspi_tree.actionable(self.form())}
+        self.assertEqual(labels, {"ax_5": "Wi-Fi", "ax_6": "Save", "ax_7": "Delete draft"})
+
+    def decide(self, nodes, *, route=("key", "endpoint", "model", None), image=("data:image/png;base64,AAAA", None)):
+        args = {"goal": "Save the form", "target_pid": 77, "target_window_id": 4194311}
+        answer = {"answers": {"next": {"choice": "e1", "probabilities": {"e0": 0.0, "e1": 1.0, "WAIT": 0.0, "DONE": 0.0, "BLOCKED": 0.0},
+                                       "confidence": 0.95},
+                              "complete": {"noul": 0.0}, "consequential": {"noul": 0.0}, "authorized": {"noul": 0.0}},
+                  "engine": "liquid/d1.2-ultra-20261116"}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server.cua_native, "human_guard"), patch.object(
+            server.atspi_tree, "snapshot", return_value=("ax-token", nodes)
+        ), patch.object(server, "jev_route", return_value=route), patch.object(
+            server, "decision_image", return_value=image
+        ) as capture, patch.object(server, "jev_evaluate", return_value=answer) as evaluate:
+            result = json.loads(server.call_tool("jev_decide", args)["content"][0]["text"])
+        return result, capture, evaluate
+
+    def test_native_decision_reads_the_window_image_with_its_controls(self):
+        result, capture, evaluate = self.decide(self.form())
+        self.assertEqual((result["operation"], result["label"], result["element_id"]), ("click_element", "Save", "ax_6"))
+        self.assertEqual((result["expected_state_token"], result["image_attached"]), ("ax-token", True))
+        image, text = evaluate.call_args.args[0]["state"]
+        self.assertEqual(image["image_url"]["url"], "data:image/png;base64,AAAA")
+        # The risky control is withheld from the model unless the goal allowed its category.
+        self.assertIn("Wi-Fi", text)
+        self.assertNotIn("Delete draft", text)
+
+    def test_native_decision_never_captures_a_window_with_a_secure_field(self):
+        nodes = self.form() + [self.item(8, "password text", "Password", parent="ax_1")]
+        result, capture, evaluate = self.decide(nodes)
+        capture.assert_not_called()
+        self.assertEqual((result["image_attached"], result["image_skip_reason"]), (False, "secure_field"))
+        self.assertIsInstance(evaluate.call_args.args[0]["state"], dict)
+
+    def test_native_decision_without_a_key_hands_element_ids_to_the_session_llm(self):
+        result, capture, evaluate = self.decide(self.form(), route=None)
+        evaluate.assert_not_called()
+        capture.assert_not_called()
+        self.assertEqual((result["mode"], result["operation"], result["expected_state_token"]), ("llm", "DEFER_TO_LLM", "ax-token"))
+        self.assertIn({"operation": "click_element", "element_id": "ax_6", "role": "button", "label": "Save"}, result["candidates"])
+        self.assertNotIn("Delete draft", json.dumps(result))
+
+    def test_verify_sends_the_window_image_and_a_model_error_is_unknown_not_a_failed_call(self):
+        def verify(evaluate_effect):
+            with patch.dict(os.environ, {"DISPLAY": ":99", "XDG_SESSION_TYPE": "x11"}), patch.object(
+                server, "list_windows", return_value=[self.window]
+            ), patch.object(
+                server.cua_native, "jev_window_labels", return_value=[{"role": "button", "label": "Save"}]
+            ), patch.object(server.atspi_tree, "snapshot", return_value=("ax-token", self.form())), patch.object(
+                server, "decision_image", return_value=("data:image/png;base64,AAAA", None)
+            ), patch.object(server, "jev_route", return_value=("key", "endpoint", "model", None)), patch.object(
+                server, "jev_evaluate", side_effect=evaluate_effect
+            ) as evaluate:
+                result = server.call_tool("verify_state", {"window_id": self.window["window_id"], "expect": {"criteria": ["Wi-Fi is on"]}})
+            return json.loads(result["content"][0]["text"]), evaluate
+        result, evaluate = verify([{"answers": {"criterion_0": {"noul": 0.97}}, "engine": "liquid/d1.2-ultra-20261116"}])
+        criterion = result["criteria"][0]
+        self.assertEqual((criterion["status"], criterion["probability"], criterion["image_attached"]), ("pass", 0.97, True))
+        self.assertEqual(criterion["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertIsInstance(evaluate.call_args.args[0]["state"], list)
+        result, _ = verify(server.Unsupported("Decision request failed (unreachable)"))
+        self.assertEqual(result["criteria"][0]["status"], "unknown")
+        self.assertIn("unreachable", result["criteria"][0]["reason"])
+
+
+class SubtaskTests(unittest.TestCase):
+    """run_subtask: the model picks among offered ids; text only from inputs; secrets never leave."""
+
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def setUp(self):
+        server.atspi_tree.STORE.clear()
+
+    def nodes(self, *, field_value="", extra=()):
+        item = AtspiTreeTests.item
+        return [item(0, "frame", "Form"), item(1, "label", "Status: Ready", parent="ax_0"),
+                item(2, "text", "Password", parent="ax_0", value=field_value, actions=["activate"]),
+                item(3, "button", "Save", parent="ax_0", actions=["click"]), *extra]
+
+    @staticmethod
+    def answer(request, operation, target=None, input_id=None, verify=0.97, constraint=0.97, submit="NONE"):
+        questions = request["questions"]
+
+        def choice(name, selected):
+            criteria = questions[name]["criteria"]
+            others = [key for key in criteria if key != selected]
+            probabilities = {key: 0.05 / len(others) for key in others} if others else {}
+            probabilities[selected] = 0.95 if others else 1.0
+            return {"choice": selected, "probabilities": probabilities, "confidence": 0.95}
+        answers = {"operation": choice("operation", operation), "constraint_ok": {"noul": constraint}}
+        if target:
+            answers["target"] = choice("target", target)
+        if input_id:
+            answers["input"] = choice("input", input_id)
+            answers["submit"] = choice("submit", submit)
+        for name in questions:
+            if name.startswith("verify_"):
+                answers[name] = {"noul": verify}
+        return {"answers": answers, "engine": "liquid/d1.2-ultra-20261116"}
+
+    def run_task(self, task, trees, script, *, click=None, set_value=None):
+        requests = []
+
+        def evaluate(request):
+            requests.append(request)
+            return script(request, len(requests) - 1)
+        args = {"target_pid": 77, "target_window_id": 4194311, **task}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "jev_route", return_value=("key", "endpoint", "model", None)
+        ), patch.object(server.atspi_tree, "snapshot", side_effect=[("ax-t%d" % index, tree) for index, tree in enumerate(trees)]
+        ), patch.object(server, "jev_evaluate", side_effect=evaluate), patch.object(
+            server.atspi_tree, "click_element", side_effect=click or (lambda *a: {"ok": True, "effect": "ui_changed"})
+        ) as clicked, patch.object(server.cua_native, "atspi_action", side_effect=set_value or (lambda *a: {"ok": True})) as written, patch.object(
+            server.subtask.time, "sleep"
+        ):
+            result = json.loads(server.call_tool("run_subtask", args)["content"][0]["text"])
+        return result, requests, clicked, written
+
+    def test_types_a_secret_saves_and_never_leaks_the_secret(self):
+        trees = [self.nodes(), self.nodes(field_value="hunter2"), self.nodes(field_value="hunter2")]
+        script = lambda request, index: (self.answer(request, "SET_VALUE", "ax_2", "input_0") if index == 0
+                                         else self.answer(request, "CLICK", "ax_3") if index == 1 else self.answer(request, "DONE"))
+        task = {"goal": "Sign in", "inputs": {"password": "hunter2"}, "secret_inputs": ["password"], "verification": ["Signed in"]}
+        result, requests, clicked, written = self.run_task(task, trees, script)
+        self.assertEqual((result["status"], result["actions_taken"]), ("SUBTASK_COMPLETE", 2))
+        self.assertEqual(written.call_args.args[2]["value"], "hunter2")
+        self.assertEqual(written.call_args.args[2]["expected_state_token"], "ax-t0")
+        self.assertEqual(clicked.call_args.args[1]["element_id"], "ax_3")
+        # The value went into the field, yet neither the model nor the caller ever saw it.
+        self.assertNotIn("hunter2", json.dumps(requests))
+        self.assertNotIn("hunter2", json.dumps(result))
+        self.assertEqual(result["history"][0]["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertIn("Status: Ready", json.dumps(requests[0]["state"]["texts"]))
+
+    def test_risky_control_is_withheld_and_a_forged_choice_is_not_executed(self):
+        item = AtspiTreeTests.item
+        tree = self.nodes(extra=[item(4, "button", "Delete account", parent="ax_0", actions=["click"])])
+        forged = lambda request, index: self.answer(request, "CLICK", "ax_3") | {"answers": {
+            **self.answer(request, "CLICK", "ax_3")["answers"],
+            "target": {"choice": "ax_4", "probabilities": {"ax_4": 1.0}, "confidence": 1.0}}}
+        result, requests, clicked, _ = self.run_task({"goal": "Clean up", "verification": ["Done"]}, [tree], forged)
+        self.assertNotIn("Delete account", json.dumps(requests[0]))
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "invalid decision"))
+        clicked.assert_not_called()
+
+    def test_a_single_candidate_gets_none_and_choosing_it_stops_without_acting(self):
+        tree = [AtspiTreeTests.item(0, "frame", "Form"), AtspiTreeTests.item(1, "button", "Save", parent="ax_0", actions=["click"])]
+        result, requests, clicked, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [tree],
+                                                     lambda request, index: self.answer(request, "CLICK", "NONE"))
+        # d1.2-ultra rejects a one-option choice with HTTP 422; NONE also lets the model refuse the only control.
+        self.assertEqual(sorted(requests[0]["questions"]["target"]["criteria"]), ["NONE", "ax_1"])
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "model chose none of the offered elements"))
+        clicked.assert_not_called()
+
+    def test_done_needs_every_verification_criterion(self):
+        result, _, _, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [self.nodes()],
+                                        lambda request, index: self.answer(request, "DONE", verify=0.6))
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "verification criterion not met: Saved"))
+
+    def test_user_activity_stops_the_loop(self):
+        def busy(*args):
+            raise server.Unsupported("human_activity: recent pointer/keyboard activity on the target window")
+        result, _, _, _ = self.run_task({"goal": "Save", "verification": ["Saved"]}, [self.nodes()],
+                                        lambda request, index: self.answer(request, "CLICK", "ax_3"), click=busy)
+        self.assertEqual((result["status"], result["reason"]), ("NEEDS_AGENT", "user took control"))
+
+    def test_dry_run_plans_without_acting(self):
+        result, _, clicked, written = self.run_task({"goal": "Save", "verification": ["Saved"], "dry_run": True}, [self.nodes()],
+                                                    lambda request, index: self.answer(request, "CLICK", "ax_3"))
+        self.assertEqual((result["status"], result["planned_action"]["target"]), ("DRY_RUN", "ax_3"))
+        clicked.assert_not_called()
+        written.assert_not_called()
+
+    def test_invalid_subtasks_are_refused_without_echoing_inputs(self):
+        for task, field in (({"goal": "x"}, "verification"), ({"goal": "x", "verification": ["v"], "shortcuts": {"MOD+S": "Save"}}, "shortcuts"),
+                            ({"goal": "x", "verification": ["v"], "inputs": {"pin": "9921"}, "secret_inputs": ["code"]}, "secret_inputs")):
+            with self.subTest(field=field), patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+                server, "jev_route", return_value=("key", "endpoint", "model", None)
+            ), self.assertRaises(ValueError) as raised:
+                server.call_tool("run_subtask", {"target_pid": 77, "target_window_id": 4194311, **task})
+            self.assertIn(field, str(raised.exception))
+            self.assertNotIn("9921", str(raised.exception))
+
+
+class ElementCheckTests(unittest.TestCase):
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def check(self, expect, nodes):
+        with patch.dict(os.environ, {"DISPLAY": ":99", "XDG_SESSION_TYPE": "x11"}), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server.atspi_tree, "snapshot", return_value=("ax-t", nodes)):
+            return json.loads(server.call_tool("verify_state", {"window_id": 4194311, "expect": expect})["content"][0]["text"])
+
+    def test_element_checks_answer_from_a_fresh_accessibility_read(self):
+        item = AtspiTreeTests.item
+        nodes = [item(0, "frame", "Form"), item(1, "text", "Name", parent="ax_0", value="Ana", states=["focused"]),
+                 item(2, "button", "Save", parent="ax_0", actions=["click"])]
+        result = self.check({"element_exists": {"role": "button", "label": "Save"},
+                             "element_value": {"role": "text", "label": "Name", "equals": "Ana"},
+                             "focused_element": {"element_id": "ax_1"}}, nodes)
+        self.assertEqual(result["status"], "pass")
+        result = self.check({"element_exists": {"role": "button", "label": "Send"}}, nodes)
+        self.assertEqual(result["status"], "fail")
+        # A read cut at the node limit cannot prove absence, so a missing element is unknown, not fail.
+        big = nodes + [item(index, "label", f"row {index}", parent="ax_0") for index in range(3, server.atspi_tree.MAX_NODES)]
+        result = self.check({"element_exists": {"role": "button", "label": "Send"}}, big)
+        self.assertEqual(result["status"], "unknown")
+
+
+class PointerMoveTests(unittest.TestCase):
+    def test_pointer_moves_never_wait_for_motion(self):
+        # xdotool mousemove --sync never returns when the pointer is already at the destination, so a second
+        # click on the same spot hung until its timeout without clicking. Nothing may ask for --sync.
+        for path in (Path(server.__file__), Path(server.cua_native.__file__)):
+            self.assertNotIn('"--sync"', path.read_text(encoding="utf-8"), path.name)
+
