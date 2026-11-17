@@ -4,6 +4,7 @@ import os
 import fcntl
 import io
 import socket
+import struct
 import tempfile
 import threading
 import time
@@ -14,12 +15,25 @@ from unittest.mock import patch
 import server
 
 
+def sent(run, verb):
+    """The xdotool commands of one kind that a run_cli mock received."""
+    return [call.args for call in run.call_args_list if call.args[:2] == ("xdotool", verb)]
+
+
+def png(width, height, tag=b""):
+    """The first bytes of a PNG of this size: enough for the server to read its IHDR."""
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", width, height) + tag
+
+
 class MCPTests(unittest.TestCase):
     window = {"window_id": 0x1234, "pid": 4321, "desktop": "0", "geometry": [10, 20, 800, 600], "title": "Editor"}
 
     def setUp(self):
         server.NATIVE_VISUAL_PROPOSALS.clear()
         server.NATIVE_VISUAL_OBSERVATIONS.clear()
+        server.cua_native.AGENT_INPUT["at"] = float("-inf")
+        server.CAPTURE["stalled_until"] = float("-inf")
+        server.cua_native.SCREENSHOTS.clear()
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -27,6 +41,10 @@ class MCPTests(unittest.TestCase):
         idle_check = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         idle_check.start()
         self.addCleanup(idle_check.stop)
+        # Whether xprop is installed must not change which X11 calls a test sees; minimized windows have their own tests.
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"
@@ -39,12 +57,49 @@ class MCPTests(unittest.TestCase):
         init = server.handle({"jsonrpc":"2.0", "id":1, "method":"initialize"})
         self.assertEqual(init["result"]["protocolVersion"], "2024-11-05")
         tools = server.handle({"jsonrpc":"2.0", "id":2, "method":"tools/list"})["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS))
+        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS) - server.UNLISTED_TOOLS)
         self.assertTrue(all("inputSchema" in t for t in tools))
         listed = {tool["name"]: tool for tool in tools}
         self.assertEqual(listed["native_visual_propose"]["inputSchema"]["required"],
                          ["target_pid", "target_window_id", "expected_state_token", "action", "decision"])
         self.assertEqual(listed["native_visual_execute"]["inputSchema"]["required"], ["proposal_id"])
+
+    def test_an_argument_the_tool_does_not_take_is_refused_with_the_ones_it_does(self):
+        # A screenshot "width" was dropped in silence, the image came back at another size and every
+        # click computed from the expected size missed. The refusal is a tool result the model reads,
+        # and it names what the tool takes; legacy tools are checked like the others.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            reply = server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                "name": "screenshot", "arguments": {"target_pid": 4321, "target_window_id": 0x1234, "width": 900}}})
+            self.assertTrue(reply["result"]["isError"])
+            self.assertIn("unknown argument: width; accepted: ", reply["result"]["content"][0]["text"])
+            self.assertIn("max_image_dimension", reply["result"]["content"][0]["text"])
+            refused = server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 1, "width": 900})["content"][0]["text"]
+            self.assertTrue(all(name in refused for name in ("accepted:", "delivery_mode", "expected_state_token")), refused)
+            token = server.state_token(self.window, b"pixels")
+            self.assertTrue(server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                "expected_state_token": token, "coordinate": [1, 2], "button": "right"})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                "expected_state_token": token, "coordinate": [1, 2], "allow_while_user_active": "yes"})
+            capture.assert_not_called()
+            execute.assert_not_called()
+
+    def test_earlier_tool_names_still_run_though_they_are_not_listed(self):
+        # left_click/type/key duplicate click/type_text/press_key with another contract, and
+        # cursor_position always failed; recorded trajectories and visual proposals still call them.
+        listed = {tool["name"] for tool in server.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/list"})["result"]["tools"]}
+        self.assertFalse(listed & {"left_click", "type", "key", "cursor_position"})
+        self.assertTrue({"click", "type_text", "press_key", "get_cursor_position", "zoom", "scroll"} <= listed)
+        token = server.state_token(self.window, b"pixels")
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            result = server.call_tool("key", {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "key": "Return"})
+        self.assertFalse(result["isError"])
+        self.assertEqual(execute.call_args.args, ("xdotool", "key", "--window", "0x1234", "Return"))
 
     def test_second_native_host_does_not_replace_or_unlink_live_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -390,7 +445,7 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "changed during screenshot"):
                 server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
 
-    def test_screenshot_token_can_be_reused_only_for_identical_pixels(self):
+    def test_screenshot_token_is_reproducible_and_refuses_unknown_tokens(self):
         token = server.state_token(self.window, b"same-pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server, "screenshot_png", return_value=b"same-pixels"
@@ -439,7 +494,7 @@ class MCPTests(unittest.TestCase):
             "expected_state_token": [], "action": "key", "key": "Return", "decision": "Press Return"}}})
         self.assertEqual(result["id"], 97)
         self.assertEqual(result["error"]["code"], -32602)
-        self.assertIn("non-empty string", result["error"]["message"])
+        self.assertIn("expected_state_token", result["error"]["message"])
 
     def test_native_visual_proposal_requires_screenshot_from_this_session(self):
         token = server.state_token(self.window, b"pixels")
@@ -465,12 +520,16 @@ class MCPTests(unittest.TestCase):
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[-1]})
             server.call_tool("native_visual_execute", {"proposal_id": proposal_ids[0]})
 
-    def test_native_visual_proposal_rejects_stale_pixels(self):
+    def test_native_visual_proposal_rejects_a_moved_window(self):
+        # The proposal's coordinates were read from the screenshot's frame; once the window moves
+        # they name another place, so the token is stale before any input.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
             server, "screenshot_png", side_effect=[b"old-pixels", b"new-pixels"]
         ), patch.object(server, "run_cli") as execute:
             server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            live[0] = {**self.window, "geometry": [400, 20, 800, 600]}
             with self.assertRaisesRegex(server.Unsupported, "stale"):
                 server.call_tool("native_visual_propose", {"target_pid": 4321, "target_window_id": 0x1234,
                     "expected_state_token": token, "action": "type", "text": "hello", "decision": "Type text"})
@@ -494,6 +553,86 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "PNG conversion requires ImageMagick"):
                 server.screenshot_png(0x1234)
 
+    def test_clicks_read_from_a_scaled_screenshot_land_on_the_same_place_in_the_window(self):
+        # A 1920x1080 window is given to the caller as 1366x768 and it picks pixels in that image;
+        # read as window pixels they landed up and to the left, on other controls. The result must
+        # also say what size the pixels are measured in.
+        window = {**self.window, "geometry": [0, 0, 1920, 1080]}
+        with patch.object(server, "list_windows", return_value=[window]), patch.object(
+            server, "screenshot_png", return_value=png(1366, 768)
+        ) as capture, patch.object(server, "run_cli", return_value="") as execute:
+            shot = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            seen = json.loads(shot["content"][1]["text"])
+            self.assertEqual((seen["image_size"], seen["window_size"]), ([1366, 768], [1920, 1080]))
+            self.assertEqual(capture.call_args.args, (0x1234, None), "None means the configured limit")
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": seen["state_token"]}
+            server.call_tool("left_click", {**base, "coordinate": [683, 384]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("960", "540"))
+            # A pixel outside the image the caller holds is refused rather than clamped.
+            execute.reset_mock()
+            with self.assertRaisesRegex(ValueError, "1366x768"):
+                server.call_tool("left_click", {**base, "coordinate": [1400, 10]})
+            execute.assert_not_called()
+            # The cua click takes pixels of the last screenshot too.
+            server.call_tool("click", {"window_id": 0x1234, "x": 683, "y": 384})
+            self.assertEqual(sent(execute, "mousemove")[0][-2:], ("960", "540"))
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": 0})
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            with self.assertRaises(ValueError):
+                server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": -1})
+
+    def test_zoom_returns_a_native_crop_whose_pixels_map_into_the_region(self):
+        # zoom was always unsupported, so small text could only be read from the scaled screenshot.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(200, 100)
+        ) as capture, patch.object(server, "run_cli") as execute:
+            zoom = server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": [400, 300, 200, 100]})
+            seen = json.loads(zoom["content"][1]["text"])
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            self.assertEqual(capture.call_args.kwargs, {"crop": [400, 300, 200, 100]})
+            self.assertEqual((seen["image_size"], seen["region"]), ([200, 100], [400, 300, 200, 100]))
+            server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                            "expected_state_token": seen["state_token"], "coordinate": [10, 20]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("410", "320"))
+            for region in ([700, 0, 200, 100], [0, 0, 0, 10], [-1, 0, 10, 10], [0, 0, 10]):
+                with self.subTest(region=region), self.assertRaises(ValueError):
+                    server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": region})
+
+    def test_capture_resizes_to_the_limit_unless_native_or_cropped(self):
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server, "run_cli_bytes", return_value=b"png"
+        ) as run:
+            for dimension, crop, options in ((None, None, ["-resize", "1366x1366>"]), (900, None, ["-resize", "900x900>"]),
+                                             (0, None, []), (0, [5, 6, 20, 10], ["-crop", "20x10+5+6", "+repage"])):
+                with self.subTest(dimension=dimension, crop=crop):
+                    server.screenshot_png(0x1234, dimension, crop=crop)
+                    self.assertEqual(list(run.call_args.args), ["/usr/bin/convert", "xwd:-", *options, "png:-"])
+
+    def test_one_deadline_bounds_the_capture_and_a_stall_then_fails_fast(self):
+        # xwd and the conversion each had their own 8 s timeout, so an X server that stopped answering
+        # cost 16 s on every call. One 12 s deadline covers the whole capture, and after a stall
+        # captures fail at once for 30 s instead of waiting it out again.
+        clock, timeouts = [100.0], []
+        def run(command, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            clock[0] += 5
+            if len(timeouts) == 3:
+                raise server.subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return server.subprocess.CompletedProcess(command, 0, stdout=b"png")
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(server.subprocess, "run", side_effect=run):
+            server.screenshot_png(0x1234, 100)
+            self.assertEqual(timeouts, [12, 7.0], "the conversion gets what xwd left of the 12 s")
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_timeout"):
+                server.screenshot_png(0x1234, 100)
+            ran = len(timeouts)
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_stalled"):
+                server.call_tool("get_desktop_state", {})
+            self.assertEqual(len(timeouts), ran, "a stalled capture runs nothing")
+            clock[0] += 31
+            self.assertEqual(server.screenshot_png(0x1234, 100), b"png")
+
     def test_valid_actions_dispatch_only_after_target_validation(self):
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli") as execute:
@@ -508,17 +647,31 @@ class MCPTests(unittest.TestCase):
             self.assertIn("--window", execute.call_args_list[5].args)
 
     def test_visual_change_makes_screenshot_token_stale_before_input(self):
+        # The token used to hash the pixels, so a blinking caret or a clock tick made it stale before
+        # the action arrived, and every pixel action recaptured up to three times. Coordinates depend
+        # on the frame they were read from, not on what was drawn in it: a repaint keeps the token
+        # (one capture checks the window still renders), a moved or resized window makes it stale.
         token = server.state_token(self.window, b"old-pixels")
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"new-pixels"), patch.object(server, "run_cli") as execute:
-            with self.assertRaisesRegex(server.Unsupported, "stale"):
-                server.call_tool("left_click", {"target_pid":4321, "target_window_id":0x1234,
-                                                   "expected_state_token":token, "coordinate":[10, 20]})
-            execute.assert_not_called()
+        live = [self.window]
+        args = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "coordinate": [10, 20]}
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=b"new-pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            server.call_tool("left_click", args)
+            self.assertEqual(execute.call_args.args, ("xdotool", "click", "--window", "0x1234", "1"))
+            self.assertEqual(capture.call_count, 1)
+            for frame in ([400, 20, 800, 600], [10, 20, 640, 600]):
+                live[0] = {**self.window, "geometry": frame}
+                execute.reset_mock()
+                with self.subTest(frame=frame), self.assertRaisesRegex(server.Unsupported, "stale"):
+                    server.call_tool("left_click", args)
+                execute.assert_not_called()
 
-    def test_failed_pre_input_recapture_prevents_dispatch(self):
+    def test_failed_pre_input_capture_prevents_dispatch(self):
+        # The one capture before input proves the window still renders; without it no input is sent.
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
-            server, "screenshot_png", side_effect=[b"pixels", server.Unsupported("capture failed")]
+            server, "screenshot_png", side_effect=server.Unsupported("capture failed")
         ), patch.object(server, "run_cli") as execute:
             with self.assertRaisesRegex(server.Unsupported, "capture failed"):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":0x1234,
@@ -530,7 +683,7 @@ class MCPTests(unittest.TestCase):
             for token in (None, "", "   "):
                 args = {"target_pid":4321, "target_window_id":0x1234, "text":"x"}
                 if token is not None: args["expected_state_token"] = token
-                with self.assertRaisesRegex(ValueError, "non-empty expected_state_token"):
+                with self.assertRaisesRegex(ValueError, "expected_state_token"):
                     server.call_tool("type", args)
             execute.assert_not_called()
 
@@ -541,6 +694,23 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "missing or ambiguous"):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":9, "expected_state_token":"old", "text":"x"})
             execute.assert_not_called()
+
+    def test_refusals_say_what_to_do_next(self):
+        # A bare "stale" or "missing" sent agents into repeating the same call.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "text": "x"}
+            with self.assertRaisesRegex(server.Unsupported, "stale.*Take a new screenshot"):
+                server.call_tool("type", {**base, "expected_state_token": "old"})
+            with self.assertRaisesRegex(server.Unsupported, "missing or ambiguous.*Call list_windows"):
+                server.call_tool("type", {**base, "target_window_id": 9, "expected_state_token": "old"})
+            execute.assert_not_called()
+            # Foreground delivery the window manager refused names the routes that remain.
+            execute.return_value = "99"
+            with patch.object(server.cua_native.time, "sleep"), self.assertRaisesRegex(
+                    server.Unsupported, "did not become active.*restore_window.*background delivery"):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": "foreground"})
 
     def test_bad_coordinates_and_key_input_refuse_dispatch(self):
         token = server.state_token(self.window, b"pixels")
@@ -573,11 +743,61 @@ class MCPTests(unittest.TestCase):
         with self.assertRaises(ValueError): server.install_host("bad")
 
     def test_list_windows_discards_wmctrl_hostname_column(self):
-        row = "0x01234567  0  4321  10  20  800  600  workstation.example  Editor - document.txt"
-        with patch.object(server, "run_cli", return_value=row):
+        row = "0x01234567  0  4321  10  20  800  600  editor.Editor  workstation.example  Editor - document.txt"
+        with patch.object(server, "run_cli", return_value=row) as run:
             windows = server.list_windows()
+        run.assert_called_once_with("wmctrl", "-lpGx")
         self.assertEqual(windows[0]["window_id"], 0x01234567)
         self.assertEqual(windows[0]["title"], "Editor - document.txt")
+        self.assertEqual(windows[0]["wm_class"], "editor.Editor")
+
+    def test_list_windows_filters_by_wm_class_and_reports_minimized_and_on_screen(self):
+        # bundle_id was refused outright on Linux, and nothing said a window was minimized or on
+        # another desktop, so callers screenshotted windows that had no pixels.
+        windows = [{**self.window, "wm_class": "gedit.Gedit"},
+                   {**self.window, "window_id": 0x2, "desktop": "1", "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x3, "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x4, "desktop": "-1", "wm_class": "conky.Conky"}]
+        with patch.object(server, "list_windows", side_effect=lambda: [dict(w) for w in windows]), patch.object(
+            server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"
+        ), patch.object(server, "run_cli", return_value="_NET_CURRENT_DESKTOP(CARDINAL) = 0"), patch.object(
+            server, "window_minimized", side_effect=lambda wid: wid == 0x3
+        ):
+            listed = json.loads(server.call_tool("list_windows", {})["content"][0]["text"])
+            self.assertEqual([(w["window_id"], w["is_minimized"], w["is_on_screen"]) for w in listed],
+                             [(0x1234, False, True), (0x2, False, False), (0x3, True, False), (0x4, False, True)])
+            for wanted, ids in (("Gedit", [0x1234]), ("gedit.Gedit", [0x1234]), ("app.py", [0x2, 0x3]), ("App.py", [0x2, 0x3]), ("py", [])):
+                with self.subTest(bundle_id=wanted):
+                    listed = json.loads(server.call_tool("list_windows", {"bundle_id": wanted})["content"][0]["text"])
+                    self.assertEqual([w["window_id"] for w in listed], ids)
+
+    def test_minimized_window_refuses_pixel_tools_and_says_how_to_restore_it(self):
+        # xwd of a minimized window fails with an X error that says nothing useful, and input to it is
+        # lost. Pixel tools refuse with a hint and a token restore_window accepts, which brings it back.
+        token = server.state_token(self.window, b"pixels")
+        hidden = [True]
+        def x11(*args):
+            if args[:2] == ("wmctrl", "-ia"):
+                hidden[0] = False  # activation de-iconifies, as window managers do
+            return "0x1234" if args[1] == "getwindowfocus" else ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "window_minimized", side_effect=lambda wid: hidden[0]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels") as capture, patch.object(server, "run_cli", side_effect=x11) as execute:
+            for name, args in (("screenshot", {}), ("zoom", {"region": [0, 0, 10, 10]}),
+                               ("type", {"expected_state_token": token, "text": "x"}),
+                               ("left_click", {"expected_state_token": token, "coordinate": [1, 1]})):
+                with self.subTest(name=name), self.assertRaisesRegex(server.Unsupported, "minimized.*restore_window") as refused:
+                    server.call_tool(name, {"target_pid": 4321, "target_window_id": 0x1234, **args})
+            capture.assert_not_called()
+            execute.assert_not_called()
+            restore_token = str(refused.exception).rsplit("state_token: ", 1)[1]
+            # The window manager maps the window a moment after it takes focus; xwd fails until then.
+            capture.side_effect = [server.Unsupported("xwd: BadMatch"), b"pixels"]
+            with patch.object(server.time, "sleep"):
+                restored = json.loads(server.call_tool("restore_window", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                                          "expected_state_token": restore_token})["content"][0]["text"])
+        self.assertTrue(restored["restored"])
+        self.assertEqual(execute.call_args_list[0].args, ("wmctrl", "-ia", "0x1234"))
 
 
 class NativePortTests(unittest.TestCase):
@@ -591,6 +811,8 @@ class NativePortTests(unittest.TestCase):
         self.native.CURSOR.update(enabled=False, x=0, y=0, theme="default", motion="instant")
         self.native.DISPATCH_DEPTH = 0
         self.native.VIDEO = None
+        self.native.AGENT_INPUT["at"] = float("-inf")
+        self.native.SCREENSHOTS.clear()
         environment = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         environment.start()
         self.addCleanup(environment.stop)
@@ -598,6 +820,9 @@ class NativePortTests(unittest.TestCase):
         utilities = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         utilities.start()
         self.addCleanup(utilities.stop)
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"
@@ -611,7 +836,7 @@ class NativePortTests(unittest.TestCase):
         return json.loads(server.call_tool(name, args or {})["content"][0]["text"])
 
     def test_every_native_tool_has_schema_and_description(self):
-        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value".split())
+        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value run_steps".split())
         catalog = {tool["name"]: tool for tool in server.schemas()}
         self.assertEqual(names, set(self.native.PROPERTIES))
         self.assertEqual(len(server.BASE_TOOLS), len(set(server.BASE_TOOLS)))
@@ -625,14 +850,16 @@ class NativePortTests(unittest.TestCase):
 
     def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         for name in self.native.PROPERTIES:
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                server.call_tool(name, {"unrecognized": True})
+            with self.subTest(name=name):
+                refused = server.call_tool(name, {"unrecognized": True})
+                self.assertTrue(refused["isError"])
+                self.assertIn("unknown argument: unrecognized; accepted: ", refused["content"][0]["text"])
         for name, args in (("click", {"x": True, "y": 1}),
                            ("click", {"x": 1, "y": 1, "delivery_mode": "guess"}),
                            ("click", {"x": 1, "y": 1, "button": "unknown"}),
                            ("click", {"x": 1, "y": 1, "count": 0}),
                            ("click", {"x": 1, "y": 1, "modifier": [1]}),
-                           ("set_config", {"max_image_dimension": 0}),
+                           ("set_config", {"max_image_dimension": -1}),
                            ("set_config", {"max_image_dimension": 16385}),
                            ("type_text", {"text": "bad\x00text"}),
                            ("launch_app", {"urls": "not-array"}),
@@ -651,9 +878,46 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             result = self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
         self.assertTrue(result["ok"])
+        self.assertNotIn("took_focus", result)
         self.assertEqual([call.args for call in run.call_args_list], [
+            ("xdotool", "getactivewindow"),
             ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
-            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1")])
+            ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+            ("xdotool", "getactivewindow")])
+
+    def test_cua_input_takes_a_screenshot_token_until_the_frame_changes_without_recapturing(self):
+        # target() recaptured the window to compare pixels, so a live window made the token stale
+        # and each action paid for a capture. The frame decides, as for the pixel tools.
+        token = server.state_token(self.window, b"pixels")
+        live = [self.window]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png"
+        ) as capture, patch.object(server, "run_cli", return_value="") as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})["ok"])
+            capture.assert_not_called()
+            live[0] = {**self.window, "geometry": [10, 20, 400, 300]}
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "stale"):
+                self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})
+            run.assert_not_called()
+
+    def test_screenshot_scale_holds_only_while_the_window_keeps_its_size(self):
+        # Click pixels are read from the image the caller was given. Once the window is resized
+        # that image no longer maps onto it, and x,y are taken as window pixels again.
+        big = {**self.window, "geometry": [0, 0, 1600, 1000]}
+        live = [big]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=png(800, 500)
+        ), patch.object(server, "run_cli", return_value="") as run:
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("201", "101"))
+            with self.assertRaises(ValueError):
+                self.value("click", {"window_id": 0x1234, "x": 800, "y": 0})
+            live[0] = {**big, "geometry": [0, 0, 1200, 900]}
+            run.reset_mock()
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(sent(run, "mousemove")[0][-2:], ("100", "50"))
 
     def test_click_foreground_activates_clicks_and_restores(self):
         def cli(*args):
@@ -668,6 +932,39 @@ class NativePortTests(unittest.TestCase):
         self.assertIn(("xdotool", "click", "--repeat", "2", "--delay", "100", "1"), calls)
         self.assertEqual(calls[-1], ("wmctrl", "-ia", "0x63"))
 
+    def test_focus_is_handed_back_only_while_the_target_holds_it_and_the_user_is_elsewhere(self):
+        # Background input must leave the user's window in front: some apps raise themselves when a
+        # control is pressed. Foreground delivery hands the front back afterwards. Neither may pull
+        # the user away from a window they went to themselves.
+        def run_click(delivery, after_input, user_on_target=False):
+            front = ["99"]
+            def cli(*args):
+                if args[1] == "getactivewindow":
+                    return front[0]
+                if args[:2] == ("wmctrl", "-ia"):
+                    front[0] = str(int(args[2], 16))
+                if args[1] == "click":
+                    front[0] = after_input
+                return ""
+            with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+                server, "run_cli", side_effect=cli
+            ) as run, patch.object(self.native, "user_on", return_value=user_on_target):
+                result = self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": delivery})
+            return result, ("wmctrl", "-ia", "0x63") in [call.args for call in run.call_args_list]
+        result, returned = run_click("background", after_input="4660")
+        self.assertTrue(returned)
+        self.assertEqual((result["took_focus"], result["focus_returned"]), (True, True))
+        for delivery, after_input, user_on_target, expected in (
+                ("background", "99", False, False),     # nothing moved
+                ("background", "4660", True, False),    # the user went to the target
+                ("foreground", "4660", False, True),    # temporary activation is undone
+                ("foreground", "777", False, False),    # the user moved on to another window
+                ("foreground", "4660", True, False)):   # the user is on the target now
+            with self.subTest(delivery=delivery, after_input=after_input, user_on_target=user_on_target):
+                result, returned = run_click(delivery, after_input, user_on_target)
+                self.assertEqual(returned, expected)
+                self.assertNotIn("took_focus", result)
+
     def test_foreground_ignores_windowactivate_failure_when_wmctrl_activates(self):
         def cli(*args):
             if args[1] == "getactivewindow":
@@ -679,7 +976,9 @@ class NativePortTests(unittest.TestCase):
             self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
         self.assertNotIn(("xdotool", "windowactivate", "0x1234"), [call.args for call in run.call_args_list])
 
-    def test_foreground_activation_failure_restores_focus(self):
+    def test_foreground_activation_failure_leaves_focus_where_it_is(self):
+        # The target never came to the front, so there is nothing to hand back; reactivating the
+        # previous window anyway could pull the user back from wherever they went.
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "99"
@@ -689,7 +988,7 @@ class NativePortTests(unittest.TestCase):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=cli) as run:
             with self.assertRaisesRegex(server.Unsupported, "foreground activation failed: target window did not become active"):
                 self.value("click", {"window_id": 0x1234, "x": 10, "y": 20, "delivery_mode": "foreground"})
-        self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
+        self.assertNotIn(("wmctrl", "-ia", "0x63"), [call.args for call in run.call_args_list])
 
     def test_foreground_restores_focus_on_input_failure(self):
         def cli(*args):
@@ -714,9 +1013,9 @@ class NativePortTests(unittest.TestCase):
     def test_keyboard_background_and_foreground_arguments(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="99") as run:
             self.value("type_text", {"window_id": 0x1234, "text": "hello"})
-            self.assertEqual(run.call_args.args, ("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello"))
+            self.assertEqual(sent(run, "type"), [("xdotool", "type", "--window", "0x1234", "--clearmodifiers", "--", "hello")])
             self.value("hotkey", {"window_id": 0x1234, "keys": ["ctrl", "c"]})
-            self.assertEqual(run.call_args.args, ("xdotool", "key", "--window", "0x1234", "ctrl+c"))
+            self.assertEqual(sent(run, "key"), [("xdotool", "key", "--window", "0x1234", "ctrl+c")])
         def cli(*args):
             if args[1] == "getactivewindow":
                 return "4660" if any(call.args == ("wmctrl", "-ia", "0x1234") for call in run.call_args_list) else "99"
@@ -727,15 +1026,15 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(run.call_args.args, ("wmctrl", "-ia", "0x63"))
 
     def test_right_click_and_modifier_cleanup(self):
-        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli") as run:
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value="") as run:
             self.value("right_click", {"window_id": 0x1234, "x": 0, "y": 0, "modifier": ["shift"]})
-        calls = [call.args for call in run.call_args_list]
+        calls = [call.args for call in run.call_args_list if call.args[1] != "getactivewindow"]
         self.assertEqual(calls[0], ("xdotool", "keydown", "--window", "0x1234", "shift"))
         self.assertEqual(calls[-2][-1], "3")
         self.assertEqual(calls[-1], ("xdotool", "keyup", "--window", "0x1234", "shift"))
 
     def test_recording_creates_evidence_before_and_after_each_mutation(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", side_effect=[b"before", b"after"]), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
             self.value("start_recording", {"output_dir": directory})
             self.value("click", {"window_id": 0x1234, "x": 1, "y": 2})
             turn = Path(directory) / "turn-00001"
@@ -817,7 +1116,7 @@ class NativePortTests(unittest.TestCase):
             turn = Path(source) / "turn-00001"
             turn.mkdir()
             (turn / "action.json").write_text(json.dumps({"name": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}}))
-            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli"):
+            with patch.object(self.native, "root_png", return_value=b"png"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", return_value=""):
                 self.value("start_recording", {"output_dir": destination})
                 self.assertTrue(self.value("replay_trajectory", {"dir": source, "delay_ms": 0})["ok"])
                 self.assertTrue((Path(destination) / "turn-00001/action.json").exists())
@@ -829,7 +1128,10 @@ class NativePortTests(unittest.TestCase):
 
     def test_config_round_trip_and_invalid_values_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "CONFIG_PATH", Path(directory) / "config.json"), patch.object(self.native, "human_guard"):
-            self.assertEqual(self.value("get_config")["max_image_dimension"], 1920)
+            # 1366 by default: clients resize larger images by an amount the caller cannot know.
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 1366)
+            self.value("set_config", {"max_image_dimension": 0})
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 0, "0 keeps the native frame")
             self.value("set_config", {"max_image_dimension": 1024})
             self.assertEqual(self.value("get_config"), {"max_image_dimension": 1024, "allow_without_activity_check": False})
             with self.assertRaises(ValueError):
@@ -860,6 +1162,116 @@ class NativePortTests(unittest.TestCase):
         outputs = ["100", "X=10\nY=20\nWINDOW=99\n", "99"]
         with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "run_cli", side_effect=outputs):
             self.native.human_guard(server, {"window_id": 0x1234})
+
+    def test_agents_own_xtest_input_is_not_taken_for_the_user(self):
+        # xdotool moves the pointer with XTest, which resets the X idle timer just as a person does,
+        # and leaves the pointer on the target: the guard before the click then refused every
+        # background click the agent made. Input this server sent is not the user's.
+        last_input = [self.native.time.monotonic() - 10]
+        def x11(*args):
+            if args[0] == "xprintidle":
+                return str(int((self.native.time.monotonic() - last_input[0]) * 1000))
+            if args[1] == "getmouselocation":
+                return "X=20\nY=40\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            if args[1] in ("mousemove", "click"):
+                last_input[0] = self.native.time.monotonic()
+            return ""
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", side_effect=x11) as run:
+            self.assertTrue(self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})["ok"])
+            self.assertIn(("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
+                          [call.args for call in run.call_args_list])
+            # The user moved over the target after the agent's last input: that is still a person.
+            self.native.AGENT_INPUT["at"] = self.native.time.monotonic() - 1
+            last_input[0] = self.native.time.monotonic()
+            run.reset_mock()
+            with self.assertRaisesRegex(server.Unsupported, "human_activity"):
+                self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
+            self.assertFalse([call for call in run.call_args_list if call.args[1:2] in (("mousemove",), ("click",))])
+
+    def test_escalation_acts_while_the_user_is_on_the_target_and_the_refusal_says_how(self):
+        # Stealth is the default, but a refusal must not be a dead end: when no quiet route exists
+        # the caller retries the same call with allow_while_user_active.
+        def cli(*args):
+            if args[0] == "xprintidle":
+                return "100"
+            if args[1] == "getmouselocation":
+                return "X=10\nY=20\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            return ""
+        def user_moves():
+            # The user's last input (100 ms ago) came after anything the agent sent.
+            self.native.AGENT_INPUT["at"] = float("-inf")
+        token = server.state_token(self.window, b"pixels")
+        legacy = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "text": "hi"}
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli", side_effect=cli) as run:
+            for name, args, verb in (("click", {"window_id": 0x1234, "x": 1, "y": 2}, "click"), ("type", legacy, "type")):
+                with self.subTest(name=name):
+                    user_moves()
+                    with self.assertRaises(server.Unsupported) as refused:
+                        server.call_tool(name, args)
+                    self.assertIn("allow_while_user_active", str(refused.exception))
+                    self.assertEqual(sent(run, verb), [])
+                    self.assertFalse(server.call_tool(name, {**args, "allow_while_user_active": True})["isError"])
+                    self.assertEqual(len(sent(run, verb)), 1)
+            with self.assertRaises(ValueError):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": "yes"})
+            # Escalating a replay does not escalate what it replays: a recorded escalation was for that moment.
+            with tempfile.TemporaryDirectory() as source:
+                (Path(source) / "turn-00001").mkdir()
+                (Path(source) / "turn-00001/action.json").write_text(json.dumps({"name": "click", "arguments": {
+                    "window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": True}}))
+                user_moves()
+                replay = self.value("replay_trajectory", {"dir": source, "allow_while_user_active": True})
+            self.assertFalse(replay["ok"])
+            self.assertIn("human_activity", replay["results"][0]["content"][0]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
+
+    def test_run_steps_stops_at_the_first_failure_and_looks_once(self):
+        # Acting and looking used to be separate round trips with the window free to change between them.
+        steps = [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                 {"tool": "type_text", "arguments": {"window_id": 0x1234, "text": "Ada"}}]
+        observe = {"target_pid": 4321, "target_window_id": 0x1234}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(800, 600)
+        ), patch.object(server, "run_cli", return_value="") as run:
+            done = server.call_tool("run_steps", {"steps": steps, "observe": observe})
+            self.assertFalse(done["isError"])
+            output = json.loads(done["content"][0]["text"])
+            self.assertEqual((output["completed"], [item["tool"] for item in output["results"]]), (2, ["click", "type_text"]))
+            self.assertEqual(done["content"][1]["type"], "image")
+            self.assertIn("state_token", json.loads(done["content"][2]["text"]))
+            run.reset_mock()
+            # Nothing after the failed step may run.
+            stopped = server.call_tool("run_steps", {"steps": [steps[0], {"tool": "screenshot", "arguments": {**observe, "width": 900}}, steps[0]]})
+            self.assertTrue(stopped["isError"])
+            halted = json.loads(stopped["content"][0]["text"])
+            self.assertEqual((halted["failed_step"], len(halted["results"])), (1, 2))
+            self.assertIn("unknown argument: width", halted["results"][1]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
+            # A step cannot start another loop of its own.
+            for nested in ("run_steps", "replay_trajectory", "no_such_tool"):
+                with self.subTest(nested=nested):
+                    self.assertTrue(server.call_tool("run_steps", {"steps": [{"tool": nested, "arguments": {}}]})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("run_steps", {"steps": []})
+
+    def test_run_steps_records_each_step_as_its_own_turn(self):
+        # A recording of run_steps must replay its steps, not one opaque call that replay refuses.
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", return_value=""):
+            self.value("start_recording", {"output_dir": directory})
+            server.call_tool("run_steps", {"steps": [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                                                     {"tool": "press_key", "arguments": {"window_id": 0x1234, "key": "Return"}}]})
+            turns = sorted(Path(directory).glob("turn-*"))
+            self.assertEqual([json.loads((turn / "action.json").read_text())["name"] for turn in turns], ["click", "press_key"])
 
     def test_health_reports_missing_idle_check(self):
         with patch.object(server.shutil, "which", return_value=None):
@@ -912,11 +1324,11 @@ class NativePortTests(unittest.TestCase):
             result = server.call_tool("get_desktop_state", {})
             self.assertEqual(result["content"][0]["type"], "image")
             self.assertEqual(run.call_args_list[0].args, ("xwd", "-silent", "-root"))
-            self.assertIn("1920x1920>", run.call_args_list[1].args)
+            self.assertIn("1366x1366>", run.call_args_list[1].args)
 
     def test_clipboard_binary_requires_png_and_xclip(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None):
-            path = Path(directory) / "image.png"
+            path = Path(directory).resolve() / "image.png"
             path.write_bytes(b"not png")
             with self.assertRaisesRegex(ValueError, "PNG"):
                 self.value("clipboard_write", {"image_path": str(path)})
@@ -955,10 +1367,34 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(popen.call_args.args[0], ["/usr/bin/xclip", "-selection", "clipboard", "-t", "text/plain;charset=utf-8", "-i"])
             self.assertEqual(popen.return_value.communicate.call_args.args, (b"hello",))
             with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "a b.txt"
+                path = Path(directory).resolve() / "a b.txt"
                 path.write_text("file")
                 self.assertEqual(self.value("clipboard_write", {"file_path": str(path)})["mime_type"], "text/uri-list")
                 self.assertEqual(popen.return_value.communicate.call_args.args, ((path.resolve().as_uri() + "\r\n").encode(),))
+
+    def test_clipboard_write_refuses_relative_and_symlinked_paths(self):
+        # A relative path depends on the server's working directory and a symlink can point at a file
+        # the caller never named; either way the clipboard would carry something else.
+        with tempfile.TemporaryDirectory() as raw, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.returncode = 0
+            directory = Path(raw).resolve()
+            (directory / "file").write_text("hello")
+            (directory / "link").symlink_to(directory / "file")
+            (directory / "parent").symlink_to(directory)
+            for path in ("file", "~/file", str(directory / "link"), str(directory / "parent" / "file")):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    self.value("clipboard_write", {"file_path": path})
+            popen.assert_not_called()
+            self.assertEqual(self.value("clipboard_write", {"file_path": str(directory / "file")})["mime_type"], "text/uri-list")
+
+    def test_clipboard_text_is_read_only_when_asked(self):
+        # Clipboard text is often private (a password just copied); listing the clipboard must not leak it.
+        with patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(
+            server, "run_cli_bytes", return_value=b"secret"
+        ) as read:
+            self.assertEqual(self.value("clipboard_read"), {"text": None})
+            read.assert_not_called()
+            self.assertEqual(self.value("clipboard_read", {"include_text": True}), {"text": "secret"})
 
     def test_optional_video_uses_x11grab_and_stops_owned_process(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None), patch.object(server.subprocess, "Popen") as popen:
@@ -1018,7 +1454,7 @@ class NativePortTests(unittest.TestCase):
     def test_human_activity_between_click_commands_stops_before_click(self):
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
             server.cua_native, "human_guard", side_effect=[None, None, server.Unsupported("human_activity")]
-        ), patch.object(server, "run_cli") as cli:
+        ), patch.object(server, "run_cli", return_value="") as cli:
             with self.assertRaisesRegex(server.Unsupported, "human_activity"):
                 self.value("click", {"window_id": self.window["window_id"], "x": 10, "y": 20})
             self.assertFalse(any(c.args[:2] == ("xdotool", "click") for c in cli.call_args_list))

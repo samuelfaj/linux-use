@@ -24,6 +24,21 @@ OVERLAY_DIR = None
 RECORDING = {"active": False, "output_dir": None, "turn": 0, "video": False}
 VIDEO = None
 DISPATCH_DEPTH = 0
+# When this server last sent X input. XTest input resets the X idle timer exactly as the user's own
+# does; the guard must not take the agent's pointer motion for a person.
+AGENT_INPUT = {"at": float("-inf")}
+# xdotool can exit before the X server has processed its last event.
+AGENT_INPUT_GRACE = 0.25
+# The last screenshot given for each window: click pixels are read from that image, not the window.
+SCREENSHOTS = {}
+# What to do next, for the refusals a caller can act on; a bare refusal sent agents into repeating the call.
+HUMAN_ACTIVITY_HINT = ("Hint: the user is using this target. Prefer a route that does not disturb them (background delivery, "
+                       "an AT-SPI action, or a short wait and one retry). If none works, retry with allow_while_user_active: true, "
+                       "unless the user said not to interrupt them.")
+STALE_HINT = "Hint: the window changed since that token was read. Take a new screenshot and retry with its state_token."
+MISSING_HINT = "Hint: that pid and window id are not on the window list now. Call list_windows."
+FOCUS_HINT = ("Hint: the window manager did not hand focus to the window. Retry once, use restore_window, "
+              "or use background delivery, which needs no focus.")
 
 STRING = {"type": "string"}
 INTEGER = {"type": "integer"}
@@ -60,7 +75,7 @@ PROPERTIES = {
     "clipboard_read": {"include_text": BOOL},
     "clipboard_write": {"text": STRING, "image_path": STRING, "file_path": STRING},
     "check_permissions": {}, "health_report": {}, "get_config": {},
-    "set_config": {"allow_without_activity_check": BOOL, "max_image_dimension": {"type": "integer", "minimum": 1, "maximum": 16384}},
+    "set_config": {"allow_without_activity_check": BOOL, "max_image_dimension": {"type": "integer", "minimum": 0, "maximum": 16384}},
     "start_session": {"session": STRING, "capture_scope": {"type": "string", "enum": ["desktop", "window"]}},
     "end_session": {}, "get_session_state": {},
     "set_agent_cursor_enabled": {"enabled": BOOL}, "set_agent_cursor_theme": {"theme_id": STRING, "theme": STRING, "reduced_motion": {"type": "string", "enum": ["auto", "on", "off"]}},
@@ -70,6 +85,11 @@ PROPERTIES = {
     "get_recording_state": {}, "replay_trajectory": {"dir": STRING, "delay_ms": {"type": "integer", "minimum": 0, "maximum": 10000}, "stop_on_error": BOOL},
     "invoke_menu": {**TARGET, "path": STRINGS},
     "set_value": {**TARGET, "role": STRING, "label": STRING, "element_id": STRING, "value": {"type": ["string", "number"]}},
+    "run_steps": {"steps": {"type": "array", "minItems": 1, "maxItems": 32, "items": {
+                      "type": "object", "properties": {"tool": STRING, "arguments": {"type": "object"}},
+                      "required": ["tool"], "additionalProperties": False}},
+                  "observe": {"type": "object", "description": "Arguments for one screenshot after the steps: target_pid, "
+                              "target_window_id and optionally max_image_dimension."}},
 }
 REQUIRED = {
     "kill_app": ["pid"], "move_cursor": ["x", "y"], "click": ["x", "y"],
@@ -79,16 +99,21 @@ REQUIRED = {
     "verify_state": ["expect"], "start_session": ["session"], "set_agent_cursor_enabled": ["enabled"],
     "set_agent_cursor_theme": [], "set_agent_cursor_motion": [],
     "start_recording": ["output_dir"], "replay_trajectory": ["dir"], "invoke_menu": ["path"],
-    "set_value": ["value"],
+    "set_value": ["value"], "run_steps": ["steps"],
 }
 for properties in PROPERTIES.values():
     properties["session"] = STRING
+ALLOW_WHILE_USER_ACTIVE = {"type": "boolean", "description": "Act even though the user is using the target. Only after the "
+                           "non-disturbing routes failed, and never when the user said not to interrupt them."}
 
 READ_ONLY = {"list_apps", "get_accessibility_tree", "get_desktop_state", "get_screen_size",
              "get_cursor_position", "verify_state", "clipboard_read", "check_permissions", "health_report",
              "get_config", "get_session_state", "get_agent_cursor_state", "get_recording_state"}
-CONTROL = {"start_recording", "stop_recording", "replay_trajectory"}
+CONTROL = {"start_recording", "stop_recording", "replay_trajectory", "run_steps"}
 MUTATIONS = set(PROPERTIES) - READ_ONLY
+# Stealth is the default; every mutation can be escalated once the quiet routes failed.
+for tool in MUTATIONS - {"run_steps"}:  # each step carries its own
+    PROPERTIES[tool]["allow_while_user_active"] = ALLOW_WHILE_USER_ACTIVE
 LEGACY_MUTATIONS = {"restore_window", "left_click", "type", "key", "scroll", "click_element",
                     "native_visual_execute", "browser_open", "browser_act", "browser_close"}
 DESCRIPTIONS = {
@@ -103,6 +128,10 @@ DESCRIPTIONS = {
     "invoke_menu": "Invoke an exact enabled AT-SPI menu path; requires python gi Atspi.",
     "set_value": "Set an editable AT-SPI value, chosen by element_id from get_ui_tree (with its state_token as expected_state_token) or by an unambiguous role/label; verifies by readback and never retries. Requires python gi Atspi.",
     "start_recording": "Record mutations as turn folders with action, before/after PNG and evidence; optionally capture ffmpeg X11 video.",
+    "clipboard_read": "Read the clipboard; its text is returned only when include_text is true.",
+    "clipboard_write": "Replace the clipboard with exactly one of text, image_path (PNG) or file_path. Paths must be absolute and contain no symlinks.",
+    "set_config": "Persist allow_without_activity_check and max_image_dimension (long-edge limit of screenshots, default 1366; 0 keeps the native frame) in ~/.linux-use/config.json.",
+    "run_steps": "Run up to 32 tool calls in order in one round trip, stopping at the first that fails, then optionally take one screenshot (observe: the arguments of screenshot). Use it to act and look together: steps:[{tool, arguments}]. Each step is validated, guarded and recorded like its own call; step results are text; a step cannot be run_steps or replay_trajectory.",
     "replay_trajectory": "Replay recorded mutations in order with current human-activity and argument checks; does not bypass stale tokens.",
 }
 
@@ -168,12 +197,10 @@ def target(s, args, optional=False):
         raise ValueError("pid must be a positive integer.")
     windows = [w for w in s.list_windows() if (wid is None or w["window_id"] == wid) and (pid is None or w["pid"] == pid)]
     if len(windows) != 1:
-        raise s.Unsupported("Target window identity is missing or ambiguous; no action was performed.")
+        raise s.Unsupported("Target window identity is missing or ambiguous; no action was performed. " + MISSING_HINT)
     window = windows[0]
-    if "expected_state_token" in args:
-        token = s.state_token(window, s.screenshot_png(window["window_id"]))
-        if args["expected_state_token"] not in (token, s.state_token(window)):
-            raise s.Unsupported("Target state token is stale; refresh before acting.")
+    if "expected_state_token" in args and s.token_view(args["expected_state_token"], window) is None:
+        raise s.Unsupported("Target state token is stale; refresh before acting. " + STALE_HINT)
     return window
 
 
@@ -185,16 +212,44 @@ def active_window(s):
         raise s.Unsupported("Cannot determine active X11 window safely.") from exc
 
 
+def front_or_none(s):
+    try:
+        return active_window(s)
+    except s.Unsupported:
+        return None
+
+
+def user_on(s, window):
+    """Whether the user is on this window now. Escalation does not apply: focus is never taken back from them."""
+    try:
+        human_guard(s, {"window_id": window["window_id"]})
+        return False
+    except s.Unsupported:
+        return True
+
+
+def hand_front_back(s, window, previous):
+    """Reactivate `previous` only while the target still holds the front and the user is not on it."""
+    if previous is None or previous == window["window_id"] or front_or_none(s) != window["window_id"] or user_on(s, window):
+        return False
+    s.run_cli("wmctrl", "-ia", hex(previous))
+    return True
+
+
 def human_guard(s, args, all_windows=False):
     if not shutil.which("xprintidle"):
         if not get_config(s)["allow_without_activity_check"]:
             raise s.Unsupported("human_activity_check_unavailable: install xprintidle")
         return
+    if args.get("allow_while_user_active") is True:
+        return
     require_x11(s)
+    started = time.monotonic()
     idle = s.run_cli("xprintidle").strip()
     if not idle.isdigit():
         raise s.Unsupported("Cannot determine X11 idle time safely.")
-    if int(idle) >= 2000:
+    # The last input arrived `idle` ms ago; when that was no later than our own last injection, it was ours.
+    if int(idle) >= 2000 or started - int(idle) / 1000 <= AGENT_INPUT["at"] + AGENT_INPUT_GRACE:
         return
     pointer = s.run_cli("xdotool", "getmouselocation", "--shell")
     match = re.search(r"^WINDOW=(\d+)$", pointer, re.M)
@@ -206,7 +261,16 @@ def human_guard(s, args, all_windows=False):
     windows = s.list_windows()
     ids = {w["window_id"] for w in windows if (wid is None or w["window_id"] == wid) and (pid is None or w["pid"] == pid)}
     if all_windows or wid is None and pid is None or active in ids or int(match[1]) in ids:
-        raise s.Unsupported("human_activity: recent pointer/keyboard activity on the target window; no mutation performed.")
+        raise s.Unsupported("human_activity: recent pointer/keyboard activity on the target window; no mutation performed. "
+                            + HUMAN_ACTIVITY_HINT)
+
+
+def inject(s, *command):
+    """Run an xdotool input command as the agent and remember when, for human_guard."""
+    try:
+        return s.run_cli(*command)
+    finally:
+        AGENT_INPUT["at"] = time.monotonic()
 
 
 def health(s):
@@ -257,18 +321,14 @@ def get_config(s):
     try:
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
         validate(config, {**schema("set_config"), "properties": PROPERTIES["set_config"]}, "config")
-        return {"max_image_dimension": 1920, "allow_without_activity_check": False, **config}
+        return {"max_image_dimension": 1366, "allow_without_activity_check": False, **config}
     except (OSError, ValueError) as exc:
         raise s.Unsupported(f"Cannot read config safely: {exc}") from exc
 
 
 def root_png(s):
     require_x11(s)
-    raw = s.run_cli_bytes("xwd", "-silent", "-root")
-    converter = shutil.which("convert") or shutil.which("magick")
-    if not converter:
-        raise s.Unsupported("Desktop screenshot requires ImageMagick convert or magick.")
-    return s.run_cli_bytes(converter, "xwd:-", "-resize", f"{get_config(s)['max_image_dimension']}x{get_config(s)['max_image_dimension']}>", "png:-", input_data=raw)
+    return s.capture_png(["-root"])
 
 
 def desktop_entries():
@@ -331,11 +391,34 @@ def application_command(args, entries):
     return result
 
 
-def position(args, window, xkey="x", ykey="y"):
-    x, y = args[xkey], args[ykey]
-    if not (0 <= x < window["geometry"][2] and 0 <= y < window["geometry"][3]):
-        raise ValueError("Coordinates are outside the target window.")
-    return str(x), str(y)
+def record_screenshot(window_id, view):
+    SCREENSHOTS.pop(window_id, None)
+    SCREENSHOTS[window_id] = view
+    while len(SCREENSHOTS) > 16:
+        SCREENSHOTS.pop(next(iter(SCREENSHOTS)))
+
+
+def to_window(window, x, y, view=None):
+    """Window pixels for x,y read from the image a caller was shown. `view` is the screenshot or zoom
+    (image_size, region, frame) they came from; without one, or once the window has another size,
+    x,y are window pixels. A pixel outside that image is refused, not clamped."""
+    width, height = window["geometry"][2:]
+    image, shown = [width, height], [0, 0, width, height]
+    if view and view.get("image_size") and list(view.get("geometry", [])[2:]) == [width, height]:
+        image, shown = view["image_size"], view.get("region") or shown
+    if not (0 <= x < image[0] and 0 <= y < image[1]):
+        raise ValueError(f"Coordinates are outside the target window's {image[0]}x{image[1]} image pixels.")
+    return shown[0] + int((x + 0.5) * shown[2] / image[0]), shown[1] + int((y + 0.5) * shown[3] / image[1])
+
+
+def pointer_view(s, args, window):
+    """The image a tool's x,y were read from: the screenshot or zoom its token names, else the last screenshot."""
+    view = s.token_view(args["expected_state_token"], window) if "expected_state_token" in args else None
+    return view if view and view.get("image_size") else SCREENSHOTS.get(window["window_id"])
+
+
+def position(args, window, xkey="x", ykey="y", view=None):
+    return tuple(map(str, to_window(window, args[xkey], args[ykey], view)))
 
 
 def keys(values):
@@ -355,18 +438,19 @@ def input_action(s, name, args):
     window = target(s, args)
     wid = hex(window["window_id"])
     foreground = args.get("delivery_mode", "background") == "foreground"
+    view = pointer_view(s, args, window)
     commands = []
     modifiers = []
     if name in ("click", "double_click", "right_click"):
-        x, y = position(args, window)
+        x, y = position(args, window, view=view)
         modifiers = keys(args["modifier"]) if args.get("modifier") else []
         button = {"left": "1", "middle": "2", "right": "3"}["right" if name == "right_click" else args.get("button", "left")]
         count = 2 if name == "double_click" else args.get("count", 1)
         commands.append(["xdotool", "mousemove", "--sync", "--window", wid, x, y])
         commands.append(["xdotool", "click", *([] if foreground else ["--window", wid]), "--repeat", str(count), "--delay", "100", button])
     elif name == "drag":
-        start = position(args, window, "from_x", "from_y")
-        end = position(args, window, "to_x", "to_y")
+        start = position(args, window, "from_x", "from_y", view)
+        end = position(args, window, "to_x", "to_y", view)
         destination = [] if foreground else ["--window", wid]
         commands = [["xdotool", "mousemove", "--sync", "--window", wid, *start],
                     ["xdotool", "mousedown", *destination, "1"],
@@ -379,7 +463,7 @@ def input_action(s, name, args):
     else:
         chord = keys(args["keys"] if name == "hotkey" else [*args.get("modifiers", []), args["key"]])
         commands = [["xdotool", "key", *([] if foreground else ["--window", wid]), "+".join(chord)]]
-    previous = active_window(s) if foreground else None
+    previous = active_window(s) if foreground else front_or_none(s)
     held = []
     activated = False
     dragging = False
@@ -398,15 +482,15 @@ def input_action(s, name, args):
                         break
                     time.sleep(0.1)
                 else:
-                    raise s.Unsupported("foreground activation failed: target window did not become active")
+                    raise s.Unsupported("foreground activation failed: target window did not become active. " + FOCUS_HINT)
         for modifier in modifiers:
-            s.run_cli("xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
+            inject(s, "xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
             held.append(modifier)
         for command in commands:
             human_guard(s, args)
             if command[1] == "mousemove":
                 note_cursor(window, int(command[-2]), int(command[-1]))
-            s.run_cli(*command)
+            inject(s, *command)
             if command[1] == "mousedown":
                 dragging = True
             if command[1] == "mouseup":
@@ -414,13 +498,18 @@ def input_action(s, name, args):
     finally:
         try:
             if dragging:
-                s.run_cli("xdotool", "mouseup", *([] if foreground else ["--window", wid]), "1")
+                inject(s, "xdotool", "mouseup", *([] if foreground else ["--window", wid]), "1")
             for modifier in reversed(held):
-                s.run_cli("xdotool", "keyup", *([] if foreground else ["--window", wid]), modifier)
+                inject(s, "xdotool", "keyup", *([] if foreground else ["--window", wid]), modifier)
         finally:
-            if previous is not None and activated:
-                s.run_cli("wmctrl", "-ia", hex(previous))
-    return {"ok": True, "window_id": window["window_id"], "delivery_mode": "foreground" if foreground else "background"}
+            if activated:
+                hand_front_back(s, window, previous)
+    result = {"ok": True, "window_id": window["window_id"], "delivery_mode": "foreground" if foreground else "background"}
+    # Background input must leave the user's window in front. Pressing a control makes some apps bring
+    # themselves forward; when the target did that and the user did not go there, hand the front back.
+    if not foreground and hand_front_back(s, window, previous):
+        result.update(took_focus=True, focus_returned=front_or_none(s) == previous)
+    return result
 
 
 def clipboard(s, name, args):
@@ -430,7 +519,8 @@ def clipboard(s, name, args):
     if not xclip and not xsel:
         raise s.Unsupported("Clipboard requires xclip or xsel.")
     if name == "clipboard_read":
-        if not args.get("include_text", True):
+        # Clipboard text is often private; read it only when asked.
+        if args.get("include_text") is not True:
             return {"text": None}
         data = s.run_cli_bytes("xclip", "-selection", "clipboard", "-o") if xclip else s.run_cli_bytes("xsel", "--clipboard", "--output")
         return {"text": data.decode("utf-8", errors="replace")}
@@ -442,7 +532,12 @@ def clipboard(s, name, args):
     if kind == "text":
         data = args[kind].encode()
     else:
-        path = Path(args[kind]).expanduser().resolve(strict=True)
+        if not os.path.isabs(args[kind]):
+            raise ValueError("Clipboard paths must be absolute.")
+        path = Path(args[kind]).resolve(strict=True)
+        # A symlink anywhere in the path could point the clipboard at a file the caller did not name.
+        if str(path) != os.path.normpath(args[kind]):
+            raise ValueError("Clipboard paths must not pass through symlinks.")
         if not path.is_file():
             raise ValueError("Clipboard path must be a file.")
         if kind == "image_path":
@@ -887,7 +982,7 @@ def dispatch(s, name, args):
         x, y = args["x"], args["y"]
         if scope == "window":
             window = target(s, args)
-            position(args, window)
+            x, y = to_window(window, x, y, pointer_view(s, args, window))
             x += window["geometry"][0]; y += window["geometry"][1]
         else:
             require_x11(s)
@@ -895,7 +990,7 @@ def dispatch(s, name, args):
             if not (0 <= x < size["width"] and 0 <= y < size["height"]):
                 raise ValueError("Coordinates are outside the desktop.")
             human_guard(s, args, all_windows=True)
-            s.run_cli("xdotool", "mousemove", "--sync", str(x), str(y))
+            inject(s, "xdotool", "mousemove", "--sync", str(x), str(y))
         CURSOR.update(x=x, y=y, scope=scope)
         return {**overlay_update(), "physical_pointer_moved": scope == "desktop"}
     if name in ("click", "double_click", "right_click", "drag", "type_text", "press_key", "hotkey"):
@@ -1033,14 +1128,47 @@ def dispatch(s, name, args):
         for index, action in enumerate(actions):
             if index:
                 time.sleep(args.get("delay_ms", 500) / 1000)
+            # Escalation was a decision about that moment; a replay yields to the user again.
+            arguments = {key: value for key, value in action["arguments"].items() if key != "allow_while_user_active"}
             try:
-                result = s.call_tool(action["name"], action["arguments"])
+                result = s.call_tool(action["name"], arguments)
             except (s.Unsupported, ValueError) as exc:
                 result = s.text_result(str(exc), error=True)
             results.append(result)
             if result.get("isError") and args.get("stop_on_error", True):
                 return {"ok": False, "results": results, "stopped_on_error": True}
         return {"ok": not any(result.get("isError") for result in results), "results": results}
+    if name == "run_steps":
+        # Acting and looking used to be separate round trips with the window free to change between them.
+        steps, results, failed = args["steps"], [], None
+        for index, step in enumerate(steps):
+            if step["tool"] not in s.BASE_TOOLS or step["tool"] in ("run_steps", "replay_trajectory"):
+                results.append({"tool": step["tool"], "ok": False, "text": "not a tool that can run as a step"})
+                failed = index
+                break
+            try:
+                result = s.call_tool(step["tool"], step.get("arguments", {}))
+            except (s.Unsupported, ValueError) as exc:
+                result = s.text_result(str(exc), error=True)
+            text = "\n".join(item["text"] for item in result["content"] if item.get("type") == "text")
+            results.append({"tool": step["tool"], "ok": not result.get("isError"), "text": text[:1200]})
+            if result.get("isError"):
+                failed = index
+                break
+        output = {"completed": len(steps) if failed is None else failed, "total": len(steps), "results": results}
+        if failed is not None:
+            output["failed_step"] = failed
+        observation = []
+        if "observe" in args:
+            try:
+                observed = s.call_tool("screenshot", args["observe"])
+            except (s.Unsupported, ValueError) as exc:
+                observed = s.text_result(str(exc), error=True)
+            if observed.get("isError"):
+                output["observation_error"] = observed["content"][0]["text"]
+            else:
+                observation = observed["content"]
+        return {"content": [{"type": "text", "text": json.dumps(output, sort_keys=True)}, *observation], "isError": failed is not None}
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1095,11 +1223,11 @@ def call(s, original, name, args):
             evidence["error"] = str(exc)
             (turn / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
             raise
-    depth_increment = int(name != "replay_trajectory")
+    depth_increment = int(name not in ("replay_trajectory", "run_steps"))  # their steps are recorded
     DISPATCH_DEPTH += depth_increment
     try:
         # Browser activity checks remain owned by the Chrome extension.
-        if mutation and not name.startswith("browser_") and name not in {"native_visual_execute", "launch_app"}:
+        if mutation and not name.startswith("browser_") and name not in {"native_visual_execute", "launch_app", "run_steps"}:
             human_guard(s, args, all_windows=name == "clipboard_write")
         value = dispatch(s, name, args) if name in PROPERTIES else original(name, args)
         result = value if isinstance(value, dict) and "content" in value else s.text_result(value, error=isinstance(value, dict) and value.get("ok") is False)
