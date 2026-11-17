@@ -94,7 +94,8 @@ class MCPTests(unittest.TestCase):
             server, "browser_request", side_effect=[first, second]
         ) as browser, patch.object(server, "jev_evaluate", return_value=self.jev_response("e0")) as evaluate:
             result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
-        self.assertEqual(result["operation"], "click_element")
+        # The proposal names the tool that executes it on the owned tab.
+        self.assertEqual((result["operation"], result["action"]), ("browser_act", "click"))
         self.assertEqual(result["ref"], "ref-current")
         self.assertEqual(result["state_token"], "token-2")
         self.assertEqual([call.args[0] for call in browser.call_args_list], ["browser_snapshot", "browser_snapshot"])
@@ -104,10 +105,24 @@ class MCPTests(unittest.TestCase):
         self.assertNotIn("private body text", serialized)
         self.assertNotIn("private field value", serialized)
 
-    def test_jev_does_not_contact_model_for_missing_credentials_or_credential_goal(self):
-        with patch.object(server, "jev_route", return_value=None), patch.object(server, "browser_request") as browser, patch.object(server, "jev_evaluate") as evaluate:
-            with self.assertRaisesRegex(server.Unsupported, "No Jev credential"):
-                server.call_tool("jev_decide", {"goal": "Open settings"})
+    def test_jev_without_key_hands_filtered_candidates_to_the_session_llm(self):
+        snapshot = self.browser_snapshot("token-1", "ref-1")
+        snapshot["elements"].append({"ref": "ref-pw", "role": "input", "name": "Login", "type": "password", "value": "hunter2"})
+        snapshot["elements"].append({"ref": "ref-del", "role": "button", "name": "Delete draft", "type": "button"})
+        with patch.object(server, "jev_route", return_value=None), patch.object(
+            server, "browser_request", return_value=snapshot
+        ), patch.object(server, "jev_evaluate") as evaluate:
+            result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
+        evaluate.assert_not_called()
+        self.assertEqual((result["mode"], result["operation"]), ("llm", "DEFER_TO_LLM"))
+        # Only safe candidates: no password field, no risky control the goal did not allow.
+        self.assertEqual(result["candidates"], [{"operation": "browser_act", "action": "click", "ref": "ref-1",
+                                                  "role": "button", "label": "Open"}])
+        self.assertEqual(result["state_token"], "token-1")
+        self.assertNotIn("hunter2", json.dumps(result))
+
+    def test_jev_does_not_contact_model_for_credential_goal(self):
+        with patch.object(server, "browser_request") as browser, patch.object(server, "jev_evaluate") as evaluate:
             with patch.object(server, "jev_route", return_value=("secret", "https://example.test", "jev")):
                 for goal in ("Enter my password", "Enter my PIN 1234", "Enter code 123  456"):
                     with self.subTest(goal=goal), self.assertRaisesRegex(server.Unsupported, "credentials"):
@@ -168,14 +183,34 @@ class MCPTests(unittest.TestCase):
         ]
         self.assertNotEqual(server.jev_snapshot_projection(first), server.jev_snapshot_projection(second))
 
-    def test_jev_done_is_blocked_without_independent_completion_verification(self):
-        snapshot1 = self.browser_snapshot("token-1", "ref-1")
-        snapshot2 = self.browser_snapshot("token-2", "ref-2")
+    def test_jev_done_needs_independent_completion_evidence(self):
+        for completion, expected in ((0.99, "DONE"), (0.5, "BLOCKED")):
+            with self.subTest(completion=completion):
+                response = self.jev_response("DONE")
+                response["answers"]["complete"]["noul"] = completion
+                with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
+                    server, "browser_request", side_effect=[self.browser_snapshot("token-1", "ref-1"), self.browser_snapshot("token-2", "ref-2")]
+                ), patch.object(server, "jev_evaluate", return_value=response):
+                    result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
+                self.assertEqual(result["operation"], expected)
+                if expected == "BLOCKED":
+                    self.assertEqual(result["reason"], "Completion evidence below threshold")
+
+    def test_jev_advice_carries_alternatives_signals_engine_and_block_reason(self):
+        response = self.jev_response("e0")
+        response["answers"]["next"]["probabilities"] = {"e0": 0.70, "WAIT": 0.30, "BLOCKED": 0.0, "DONE": 0.0}
+        response["answers"]["consequential"]["noul"] = 0.9
+        response["answers"]["authorized"]["noul"] = 0.99
+        response.update(engine="typesafe/jev-1.14", fallback_reason="liquid/d1.2-ultra HTTP 503")
         with patch.object(server, "jev_route", return_value=("key", "https://example.test", "jev")), patch.object(
-            server, "browser_request", side_effect=[snapshot1, snapshot2]
-        ), patch.object(server, "jev_evaluate", return_value=self.jev_response("DONE")):
+            server, "browser_request", side_effect=[self.browser_snapshot("token-1", "ref-1"), self.browser_snapshot("token-2", "ref-2")]
+        ), patch.object(server, "jev_evaluate", return_value=response):
             result = json.loads(server.call_tool("jev_decide", {"goal": "Open settings"})["content"][0]["text"])
-        self.assertEqual(result["operation"], "BLOCKED")
+        # 0.70 is below the material threshold; the reason lets the session LLM ask the user instead of guessing.
+        self.assertEqual((result["operation"], result["reason"]), ("BLOCKED", "Choice below material confidence threshold"))
+        self.assertEqual(result["signals"], {"complete": 0.99, "consequential": 0.9, "authorized": 0.99})
+        self.assertEqual(result["alternatives"], [{"operation": "WAIT", "probability": 0.30}])
+        self.assertEqual((result["engine"], result["fallback_reason"]), ("typesafe/jev-1.14", "liquid/d1.2-ultra HTTP 503"))
 
     def test_risk_classify_uses_whole_words_and_phrases(self):
         self.assertEqual(server.risk_classify("Empty   Trash"), "delete")
@@ -200,7 +235,7 @@ class MCPTests(unittest.TestCase):
             self.assertEqual(result["operation"], "BLOCKED")
             evaluate.assert_not_called()
         result, evaluate = decide(["delete"])
-        self.assertEqual(result["operation"], "click_element")
+        self.assertEqual(result["operation"], "browser_act")
         self.assertEqual(result["ref"], "ref-2")
 
     def test_jev_risky_target_is_material_even_when_model_says_routine(self):
@@ -223,7 +258,7 @@ class MCPTests(unittest.TestCase):
             ), patch.object(server, "jev_evaluate", return_value=response):
                 return json.loads(server.call_tool("jev_decide", {"goal": "Open settings", **gates})["content"][0]["text"])
         result = decide()
-        self.assertEqual(result["operation"], "click_element")
+        self.assertEqual(result["operation"], "browser_act")
         self.assertAlmostEqual(result["margin"], 0.2)
         result = decide(min_margin=0.5)
         self.assertEqual(result["operation"], "NEEDS_AGENT")
