@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import fcntl
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 import server
 
@@ -51,7 +53,7 @@ class MCPTests(unittest.TestCase):
             lock_file = open(lock_path, "a")
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
-                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(
+                with patch.object(server, "BRIDGE_PATH", bridge), patch.object(server, "installed_extension_id", return_value="a" * 32), patch.object(
                     server.sys, "argv", ["server.py", "chrome-native-host", "chrome-extension://" + "a" * 32 + "/"]
                 ):
                     server.native_host()
@@ -1136,6 +1138,56 @@ class BrowserPortTests(unittest.TestCase):
                     server.browser_request("browser_snapshot", {}, timeout=2)
                 closing.join()
                 self.assertNotIsInstance(caught.exception, server.BridgeTimeout)
+
+    def test_native_host_tells_the_caller_when_the_extension_never_answers(self):
+        # A page Chrome froze kept the extension from answering; the host waited forever and every
+        # later call hung behind it. Now the caller hears why, and the host exits so Chrome starts a
+        # clean one when the extension reconnects.
+        origin = "chrome-extension://" + "a" * 32 + "/"
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        with contextlib.ExitStack() as stack:
+            for fd in (stdin_r, stdin_w, stdout_r, stdout_w):
+                stack.callback(os.close, fd)
+            bridge = Path(stack.enter_context(tempfile.TemporaryDirectory())) / "bridge.sock"
+            chrome_reads = stack.enter_context(open(stdout_r, "rb", closefd=False))
+            host_stdin = stack.enter_context(open(stdin_r, "rb", closefd=False))
+            host_stdout = stack.enter_context(open(stdout_w, "wb", closefd=False))
+            for target, name, value in ((server, "BRIDGE_PATH", bridge), (server, "installed_extension_id", lambda: "a" * 32),
+                                        (server.sys, "argv", ["server.py", "chrome-native-host", origin]),
+                                        (server.sys, "stdin", host_stdin), (server.sys, "stdout", SimpleNamespace(buffer=host_stdout))):
+                stack.enter_context(patch.object(target, name, value))
+            host = threading.Thread(target=server.native_host, kwargs={"response_timeout": 0.3}, daemon=True)
+            host.start()
+            deadline = time.monotonic() + 2
+            while not bridge.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as caller:
+                caller.settimeout(5)  # a host without its deadline fails this test instead of hanging it
+                caller.connect(str(bridge))
+                with caller.makefile("wb") as writer:
+                    server._write_frame(writer, {"id": "r1", "operation": "browser_snapshot"})
+                with caller.makefile("rb") as reader:
+                    answer = server._read_frame(reader)
+            host.join(2)
+            self.assertEqual(server._read_frame(chrome_reads)["id"], "r1")
+        self.assertEqual(answer["id"], "r1")
+        self.assertIs(answer["ok"], False)
+        self.assertIn("did not answer", answer["error"])
+        self.assertFalse(host.is_alive())
+        self.assertFalse(bridge.exists())
+
+    def test_native_host_serves_only_the_registered_extension(self):
+        # The host is a plain script anyone can start with any origin argument; only the extension
+        # install_host registered may open the bridge into the user's Chrome profile.
+        for registered, origin in (("a" * 32, "chrome-extension://" + "b" * 32 + "/"), (None, "chrome-extension://" + "a" * 32 + "/")):
+            with self.subTest(registered=registered), tempfile.TemporaryDirectory() as directory, open(os.devnull, "rb") as stdin, patch.object(
+                server, "BRIDGE_PATH", Path(directory) / "bridge.sock"
+            ), patch.object(server, "installed_extension_id", return_value=registered), patch.object(
+                server.sys, "argv", ["server.py", "chrome-native-host", origin]
+            ), patch.object(server.sys, "stdin", stdin):
+                server.native_host()
+                self.assertFalse(server.BRIDGE_PATH.with_suffix(".lock").exists())
 
     def test_installed_extension_id_reads_what_install_host_registered(self):
         # The native host trusts only this origin and browser_status says not_installed without it,

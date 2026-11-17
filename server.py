@@ -943,10 +943,31 @@ def jev_decide(goal, allowed_risks=None, min_confidence=None, min_margin=None):
             "instruction": "This is advice only. Reauthorize consequential effects and use browser_act with this ref; the extension revalidates the live element before acting."}
 
 
-def native_host():
-    """Multiplex Chrome native messaging with the local MCP-to-extension socket."""
+def _read_frame_fd(fd, deadline):
+    """One frame from a raw descriptor by `deadline` (time.monotonic()). Raw reads, because select
+    cannot see bytes a buffered reader has already taken."""
+    def exactly(size):
+        data = b""
+        while len(data) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                raise TimeoutError("frame deadline passed")
+            chunk = os.read(fd, size - len(data))
+            if not chunk: raise EOFError
+            data += chunk
+        return data
+    size = struct.unpack("<I", exactly(4))[0]
+    if not 1 <= size <= 1_048_576: raise ValueError("Invalid frame size")
+    return json.loads(exactly(size))
+
+
+def native_host(response_timeout=35):
+    """Multiplex Chrome native messaging with the local MCP-to-extension socket. A caller has 2 s to
+    send its request; the extension has `response_timeout`, under the caller's 40 s, to answer it."""
     origin = sys.argv[2] if len(sys.argv) > 2 else ""
-    if not re.fullmatch(r"chrome-extension://[a-p]{32}/", origin): return
+    extension_id = installed_extension_id()
+    # Serve only the extension install_host registered, whatever origin the launcher was given.
+    if extension_id is None or origin != f"chrome-extension://{extension_id}/": return
     BRIDGE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(BRIDGE_PATH.parent, 0o700)
     lock_file = open(BRIDGE_PATH.with_suffix(".lock"), "a")
@@ -956,22 +977,42 @@ def native_host():
         lock_file.close()
         return
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stdin = sys.stdin.fileno()
     try:
         BRIDGE_PATH.unlink(missing_ok=True)
         listener.bind(str(BRIDGE_PATH)); os.chmod(BRIDGE_PATH, 0o600); listener.listen(8)
         while True:
-            ready, _, _ = select.select([listener, sys.stdin.buffer], [], [])
-            if sys.stdin.buffer in ready: return
+            ready, _, _ = select.select([listener, stdin], [], [])
+            # Chrome's pipe closing means the extension disconnected; leave no host or action behind.
+            if stdin in ready: return
             client, _ = listener.accept()
             with client:
                 try:
-                    request = _read_frame(client.makefile("rb"))
-                    _write_frame(sys.stdout.buffer, request)
-                    response = _read_frame(sys.stdin.buffer)
-                    if response.get("id") != request.get("id"): raise ValueError("Response ID mismatch")
-                    _write_frame(client.makefile("wb"), response)
+                    request = _read_frame_fd(client.fileno(), time.monotonic() + 2)
                 except (ValueError, EOFError, OSError):
                     continue
+                if not isinstance(request, dict): continue
+                client.settimeout(1)
+                try:
+                    _write_frame(sys.stdout.buffer, request)
+                    response = _read_frame_fd(stdin, time.monotonic() + response_timeout)
+                except (ValueError, EOFError, OSError):
+                    # Say why before exiting; a silent close reads as a dead bridge. Chrome starts a
+                    # clean host when the extension reconnects.
+                    try:
+                        with client.makefile("wb") as writer:
+                            _write_frame(writer, {"id": request.get("id", ""), "ok": False,
+                                                  "error": "Chrome extension did not answer. It reconnects by itself; check browser_status before retrying."})
+                    except OSError:
+                        pass
+                    return
+                if not isinstance(response, dict) or response.get("id") != request.get("id"): return
+                # A caller can disappear after an action. Do not replay it.
+                try:
+                    with client.makefile("wb") as writer:
+                        _write_frame(writer, response)
+                except OSError:
+                    pass
     finally:
         listener.close(); BRIDGE_PATH.unlink(missing_ok=True); lock_file.close()
 
