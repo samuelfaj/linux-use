@@ -1011,6 +1011,35 @@ class BrowserPortTests(unittest.TestCase):
                 self.assertTrue(tools[name]["inputSchema"]["properties"])
                 self.assertNotIn("separately registered", tools[name]["description"])
 
+    def test_every_page_tool_lets_the_caller_escalate_and_the_flag_reaches_the_extension(self):
+        # The extension refuses a tab the user selected unless the call carries allow_while_user_active.
+        # The schemas forbid unknown properties, so a tool without it could never escalate; and only
+        # the extension can tell whether the user is on the tab, so the server must pass it through.
+        tools = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}
+        for name in server.BROWSER_PAGE_TOOLS:
+            with self.subTest(name=name):
+                self.assertEqual(tools[name]["properties"]["allow_while_user_active"]["type"], "boolean")
+                self.assertFalse(tools[name]["additionalProperties"])
+        # A dialog in a tab the user selected is theirs; open, close and status act on no page.
+        others = {"browser_dialog", "browser_open", "browser_close", "browser_status"}
+        for name in others:
+            self.assertNotIn("allow_while_user_active", tools[name]["properties"])
+        # A new browser tool has to be classified one way or the other.
+        self.assertEqual(set(server.BROWSER_PAGE_TOOLS) | others,
+                         {name for name in server.BASE_TOOLS if name.startswith("browser_") or name == "page"})
+        with patch.object(server, "browser_request", return_value={"url": "https://example.com/"}) as request:
+            server.call_tool("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+        request.assert_called_once_with("browser_click", {"x": 1, "y": 2, "allow_while_user_active": True})
+
+    def test_snapshot_query_is_accepted_and_forwarded(self):
+        # A long page buries the one control a task needs past the 200-element cap; query is how the
+        # caller reaches it, so the schema must admit it and the server must forward it unchanged.
+        schema = {tool["name"]: tool["inputSchema"] for tool in server.schemas()}["browser_snapshot"]
+        self.assertEqual(schema["properties"]["query"]["type"], "string")
+        with patch.object(server, "browser_request", return_value={"elements": []}) as request:
+            server.call_tool("browser_snapshot", {"query": "delete app"})
+        request.assert_called_once_with("browser_snapshot", {"query": "delete app"})
+
     def test_download_moves_completed_file_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(server.Path, "home", return_value=Path(folder)):
             downloads = Path(folder) / "Downloads" / "linux-use"

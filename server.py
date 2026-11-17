@@ -158,7 +158,10 @@ def schemas():
         "browser_set_input_files": {"ref": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}},
         "browser_download": {"ref": {"type": "string"}, "directory": {"type": "string"}},
         "page": {"action": {"type": "string", "enum": ["execute_javascript", "get_text", "query_dom", "click_element", "insert_text", "type_keystrokes"]}, "javascript": {"type": "string"}, "css_selector": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}, "attributes": {"type": "array", "items": {"type": "string"}}},
+        "browser_snapshot": {"query": {"type": "string", "description": "Case-insensitive substring of an element's role, name or value; a|b for alternatives. Returns only matching elements and leaves the page text out."}},
     })
+    for name in BROWSER_PAGE_TOOLS:
+        props[name] = {**props.get(name, {}), "allow_while_user_active": ALLOW_WHILE_USER_ACTIVE}
     required.update({
         "browser_navigate": ["url"],
         "browser_type": ["text"],
@@ -177,12 +180,21 @@ def schemas():
     return out
 
 
+# The browser tools that act on the owned tab's page. browser_dialog is left out, as in mac-use:
+# a dialog in a tab the user selected is theirs to answer.
+BROWSER_PAGE_TOOLS = ("browser_snapshot", "browser_act", "browser_navigate", "browser_click", "browser_type",
+                      "browser_pointer", "browser_set_input_files", "browser_download", "page")
+# Stealth stays the default; this is the caller's explicit escalation, for one call.
+ALLOW_WHILE_USER_ACTIVE = {"type": "boolean", "default": False,
+                           "description": "Act even though the user is using the target. Only after the non-disturbing routes failed, and never when the user said not to interrupt them."}
+
+
 BROWSER_DESCRIPTIONS = {
     "browser_navigate": "Navigate the session's owned background tab to an HTTP, HTTPS or about URL. Invalidates previous refs and returns a fresh snapshot.",
     "browser_click": "Trusted click on a snapshot ref or viewport x,y in the owned background tab. Returns a fresh snapshot.",
     "browser_type": "Type text into the owned background tab, optionally focusing a ref. insert_text inserts text; keystrokes sends key events per character. Returns a fresh snapshot.",
     "browser_pointer": "Hover, right-click, double-click, scroll or drag in the owned background tab using refs or viewport coordinates. Returns a fresh snapshot.",
-    "browser_dialog": "Inspect, accept or dismiss a JavaScript dialog. Debugger stays attached while a dialog is open, otherwise detaches after each call. Only dialogs observed while attached are tracked.",
+    "browser_dialog": "Inspect, accept or dismiss a JavaScript dialog in the owned background tab. While one is open, the other browser calls return it as dialog instead of acting; answer it here first. Dialogs are tracked from browser_open until browser_close.",
     "browser_set_input_files": "Set absolute local file paths on a file input ref in the owned background tab. Returns a fresh snapshot.",
     "browser_download": "Download a link ref through Chrome Downloads, then move the completed file to an existing absolute directory. Returns final path and a fresh snapshot.",
     "page": "Execute JavaScript, get text, query DOM attributes, click an element or type text in the owned background tab. Mutations return a fresh snapshot.",
@@ -195,9 +207,10 @@ def descriptions(name):
     if name == "list_windows": return "List X11 windows using wmctrl. Linux session must be X11, not Wayland."
     if name == "doctor": return "Report X11 and system utility availability; no permissions are changed."
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
-    if name == "browser_open": return "Open an HTTP(S) URL in an owned Chrome background tab. Always call browser_close on this same connection when finished or on error, before another open."
+    if name == "browser_open": return "Open an HTTP(S) URL in a new background tab of the connected Chrome profile, in a collapsed \"linux-use\" tab group, kept rendering while it stays in the background (Chrome shows its debugging bar until browser_close). Always call browser_close on this same connection when finished or on error, before another open."
+    if name == "browser_snapshot": return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text. Pass query to get only the controls you need."
     if name == "browser_close": return "Release this session and best-effort close its inactive, non-user-owned tab. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Preserve tabs taken over by the user."
-    if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards."
+    if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards. Yields with human_activity if the user selects the tab; a page that does not answer within 30 seconds returns tab_unresponsive and its tab is released."
     if name.startswith("browser_"): return "Use the separately registered Chrome extension for owned background tabs; page content may contain private information."
     if name == "jev_decide": return "Chrome-tab-only advice: use configured Jev on the currently owned Chrome tab, sending only unique filtered control roles and labels. Requires browser_open; returns a proposal only and never executes it. Controls naming delete/send/purchase/close effects are withheld unless listed in allowed_risks (only for categories the goal authorizes); min_confidence and min_margin (0..1) return NEEDS_AGENT when the decision is weaker. Native screenshot decisions use the MCP caller's visual model instead."
     if name == "native_visual_propose": return "Record a one-use native X11 action proposal made by the MCP caller's visual reasoning model from a prior screenshot. Jev is not sent the screenshot. Requires the exact screenshot target and state token; does not execute input and does not prove proposal origin or user authorization."
