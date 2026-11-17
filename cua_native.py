@@ -290,11 +290,7 @@ def get_config(s):
 
 def root_png(s):
     require_x11(s)
-    raw = s.run_cli_bytes("xwd", "-silent", "-root")
-    converter = shutil.which("convert") or shutil.which("magick")
-    if not converter:
-        raise s.Unsupported("Desktop screenshot requires ImageMagick convert or magick.")
-    return s.run_cli_bytes(converter, "xwd:-", "-resize", f"{get_config(s)['max_image_dimension']}x{get_config(s)['max_image_dimension']}>", "png:-", input_data=raw)
+    return s.capture_png(["-root"])
 
 
 def desktop_entries():

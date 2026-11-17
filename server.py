@@ -121,33 +121,49 @@ def verified_target(args, require_token=False, verify_screenshot=False):
     return window, state_token(window, screenshot)
 
 
-def run_cli_bytes(*args, input_data=None):
+def run_cli_bytes(*args, input_data=None, timeout=8):
     executable = shutil.which(args[0])
     if not executable:
         raise Unsupported(f"Unsupported/unavailable: required system utility {args[0]!r} is not installed.")
     try:
-        return subprocess.run([executable, *args[1:]], input=input_data, check=True, capture_output=True, timeout=8).stdout
+        return subprocess.run([executable, *args[1:]], input=input_data, check=True, capture_output=True, timeout=timeout).stdout
     except (subprocess.SubprocessError, OSError) as exc:
         raise Unsupported(f"X11 utility failed safely: {exc}") from exc
 
 
-def screenshot_png(window_id, dimension=None):
-    xwd = run_cli_bytes("xwd", "-silent", "-id", hex(window_id))
-    convert = shutil.which("convert")
-    if convert:
-        command = [convert, "xwd:-", "png:-"]
-    else:
-        magick = shutil.which("magick")
-        if not magick:
-            raise Unsupported("Unsupported/unavailable: screenshot PNG conversion requires ImageMagick 'convert' or 'magick'.")
-        command = [magick, "xwd:-", "png:-"]
-    if dimension is None:
-        dimension = cua_native.get_config(sys.modules[__name__])["max_image_dimension"]
-    command[-1:-1] = ["-resize", f"{dimension}x{dimension}>"]
+# One deadline covers xwd and the PNG conversion. An X server that stops answering would otherwise
+# cost the full timeout on every call, so after a stall captures fail fast for a while.
+CAPTURE_SECONDS = 12
+CAPTURE_RETRY_SECONDS = 30
+CAPTURE = {"stalled_until": float("-inf")}
+
+
+def capture_png(source, dimension=None):
+    """xwd of `source` (["-id", window] or ["-root"]) as PNG, its long edge limited to `dimension`."""
+    now = time.monotonic()
+    if now < CAPTURE["stalled_until"]:
+        raise Unsupported(f"screen_capture_stalled: a capture did not finish in {CAPTURE_SECONDS} s; "
+                          f"retry in {CAPTURE['stalled_until'] - now:.0f} s.")
+    deadline = now + CAPTURE_SECONDS
     try:
-        return subprocess.run(command, input=xwd, check=True, capture_output=True, timeout=8).stdout
-    except (subprocess.SubprocessError, OSError) as exc:
-        raise Unsupported(f"Screenshot PNG conversion failed safely: {exc}") from exc
+        raw = run_cli_bytes("xwd", "-silent", *source, timeout=CAPTURE_SECONDS)
+        converter = shutil.which("convert") or shutil.which("magick")
+        if not converter:
+            raise Unsupported("Unsupported/unavailable: screenshot PNG conversion requires ImageMagick 'convert' or 'magick'.")
+        if dimension is None:
+            dimension = cua_native.get_config(sys.modules[__name__])["max_image_dimension"]
+        return run_cli_bytes(converter, "xwd:-", "-resize", f"{dimension}x{dimension}>", "png:-", input_data=raw,
+                             timeout=max(0.0, deadline - time.monotonic()))
+    except Unsupported as exc:
+        if isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            CAPTURE["stalled_until"] = time.monotonic() + CAPTURE_RETRY_SECONDS
+            raise Unsupported(f"screen_capture_timeout: the capture did not finish in {CAPTURE_SECONDS} s; "
+                              f"captures fail fast for {CAPTURE_RETRY_SECONDS} s.") from exc
+        raise
+
+
+def screenshot_png(window_id, dimension=None):
+    return capture_png(["-id", hex(window_id)], dimension)
 
 
 def schemas():

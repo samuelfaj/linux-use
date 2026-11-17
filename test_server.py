@@ -15,6 +15,7 @@ class MCPTests(unittest.TestCase):
         server.NATIVE_VISUAL_PROPOSALS.clear()
         server.NATIVE_VISUAL_OBSERVATIONS.clear()
         server.cua_native.AGENT_INPUT["at"] = float("-inf")
+        server.CAPTURE["stalled_until"] = float("-inf")
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -490,6 +491,31 @@ class MCPTests(unittest.TestCase):
         with patch.object(server, "run_cli_bytes", return_value=b"fake-xwd"), patch.object(server.shutil, "which", return_value=None):
             with self.assertRaisesRegex(server.Unsupported, "PNG conversion requires ImageMagick"):
                 server.screenshot_png(0x1234)
+
+    def test_one_deadline_bounds_the_capture_and_a_stall_then_fails_fast(self):
+        # xwd and the conversion each had their own 8 s timeout, so an X server that stopped answering
+        # cost 16 s on every call. One 12 s deadline covers the whole capture, and after a stall
+        # captures fail at once for 30 s instead of waiting it out again.
+        clock, timeouts = [100.0], []
+        def run(command, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            clock[0] += 5
+            if len(timeouts) == 3:
+                raise server.subprocess.TimeoutExpired(command, kwargs["timeout"])
+            return server.subprocess.CompletedProcess(command, 0, stdout=b"png")
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server.time, "monotonic", side_effect=lambda: clock[0]
+        ), patch.object(server.subprocess, "run", side_effect=run):
+            server.screenshot_png(0x1234, 100)
+            self.assertEqual(timeouts, [12, 7.0], "the conversion gets what xwd left of the 12 s")
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_timeout"):
+                server.screenshot_png(0x1234, 100)
+            ran = len(timeouts)
+            with self.assertRaisesRegex(server.Unsupported, "screen_capture_stalled"):
+                server.call_tool("get_desktop_state", {})
+            self.assertEqual(len(timeouts), ran, "a stalled capture runs nothing")
+            clock[0] += 31
+            self.assertEqual(server.screenshot_png(0x1234, 100), b"png")
 
     def test_valid_actions_dispatch_only_after_target_validation(self):
         token = server.state_token(self.window, b"pixels")
