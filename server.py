@@ -27,6 +27,10 @@ BROWSER_SESSION = str(uuid.uuid4())
 BASE_TOOLS = ["screenshot", "zoom", "cursor_position", "list_windows", "get_ui_tree", "jev_decide", "doctor", "restore_window", "left_click", "type", "key", "scroll", "click_element", "native_visual_propose", "native_visual_execute", "browser_open", "browser_snapshot", "browser_act", "browser_close", "browser_status"]
 BASE_TOOLS += ["browser_navigate", "browser_click", "browser_type", "browser_pointer", "browser_dialog", "browser_set_input_files", "browser_download", "page"]
 BASE_TOOLS += list(cua_native.PROPERTIES)
+# Earlier names whose job a listed tool does (click, type_text, press_key, get_cursor_position). Mixing two
+# families with different contracts cost callers failed calls, so only one is listed; these still run
+# for recorded trajectories and visual proposals.
+UNLISTED_TOOLS = {"left_click", "type", "key", "cursor_position"}
 NATIVE_VISUAL_PROPOSALS = {}
 NATIVE_VISUAL_OBSERVATIONS = {}
 
@@ -173,7 +177,7 @@ def screenshot_png(window_id, dimension=None, crop=None):
     return capture_png(["-id", hex(window_id)], dimension, crop)
 
 
-def schemas():
+def schemas(listed_only=True):
     targeting = {"target_app": {"type": "string"}, "target_pid": {"type": "integer"},
                  "target_window_id": {"type": "integer"}, "expected_state_token": {"type": "string"}}
     props = {
@@ -226,6 +230,8 @@ def schemas():
     })
     out = []
     for name in BASE_TOOLS:
+        if listed_only and name in UNLISTED_TOOLS:
+            continue
         out.append({"name": name, "description": descriptions(name), "inputSchema": {
             "type": "object", "properties": props.get(name, {}), "required": required.get(name, []), "additionalProperties": False}})
         if name in cua_native.PROPERTIES:
@@ -345,6 +351,13 @@ def take_native_visual_proposal(proposal_id):
 
 
 def call_tool(name, args):
+    schema = next((tool["inputSchema"] for tool in schemas(listed_only=False) if tool["name"] == name), None)
+    if schema is not None and isinstance(args, dict):
+        # An argument dropped in silence looks honored (a screenshot "width" was); name the accepted ones.
+        unknown = sorted(set(args) - set(schema["properties"]))
+        if unknown:
+            return text_result(f"unknown argument: {unknown[0]}; accepted: {', '.join(sorted(schema['properties']))}", error=True)
+        cua_native.validate(args, schema)
     return cua_native.call(sys.modules[__name__], _call_tool, name, args)
 
 

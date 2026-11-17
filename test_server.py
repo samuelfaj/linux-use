@@ -47,12 +47,49 @@ class MCPTests(unittest.TestCase):
         init = server.handle({"jsonrpc":"2.0", "id":1, "method":"initialize"})
         self.assertEqual(init["result"]["protocolVersion"], "2024-11-05")
         tools = server.handle({"jsonrpc":"2.0", "id":2, "method":"tools/list"})["result"]["tools"]
-        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS))
+        self.assertEqual({t["name"] for t in tools}, set(server.BASE_TOOLS) - server.UNLISTED_TOOLS)
         self.assertTrue(all("inputSchema" in t for t in tools))
         listed = {tool["name"]: tool for tool in tools}
         self.assertEqual(listed["native_visual_propose"]["inputSchema"]["required"],
                          ["target_pid", "target_window_id", "expected_state_token", "action", "decision"])
         self.assertEqual(listed["native_visual_execute"]["inputSchema"]["required"], ["proposal_id"])
+
+    def test_an_argument_the_tool_does_not_take_is_refused_with_the_ones_it_does(self):
+        # A screenshot "width" was dropped in silence, the image came back at another size and every
+        # click computed from the expected size missed. The refusal is a tool result the model reads,
+        # and it names what the tool takes; legacy tools are checked like the others.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ) as capture, patch.object(server, "run_cli") as execute:
+            reply = server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+                "name": "screenshot", "arguments": {"target_pid": 4321, "target_window_id": 0x1234, "width": 900}}})
+            self.assertTrue(reply["result"]["isError"])
+            self.assertIn("unknown argument: width; accepted: ", reply["result"]["content"][0]["text"])
+            self.assertIn("max_image_dimension", reply["result"]["content"][0]["text"])
+            refused = server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 1, "width": 900})["content"][0]["text"]
+            self.assertTrue(all(name in refused for name in ("accepted:", "delivery_mode", "expected_state_token")), refused)
+            token = server.state_token(self.window, b"pixels")
+            self.assertTrue(server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                "expected_state_token": token, "coordinate": [1, 2], "button": "right"})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                "expected_state_token": token, "coordinate": [1, 2], "allow_while_user_active": "yes"})
+            capture.assert_not_called()
+            execute.assert_not_called()
+
+    def test_earlier_tool_names_still_run_though_they_are_not_listed(self):
+        # left_click/type/key duplicate click/type_text/press_key with another contract, and
+        # cursor_position always failed; recorded trajectories and visual proposals still call them.
+        listed = {tool["name"] for tool in server.handle({"jsonrpc": "2.0", "id": 6, "method": "tools/list"})["result"]["tools"]}
+        self.assertFalse(listed & {"left_click", "type", "key", "cursor_position"})
+        self.assertTrue({"click", "type_text", "press_key", "get_cursor_position", "zoom", "scroll"} <= listed)
+        token = server.state_token(self.window, b"pixels")
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            result = server.call_tool("key", {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "key": "Return"})
+        self.assertFalse(result["isError"])
+        self.assertEqual(execute.call_args.args, ("xdotool", "key", "--window", "0x1234", "Return"))
 
     def test_second_native_host_does_not_replace_or_unlink_live_bridge(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -445,7 +482,7 @@ class MCPTests(unittest.TestCase):
             "expected_state_token": [], "action": "key", "key": "Return", "decision": "Press Return"}}})
         self.assertEqual(result["id"], 97)
         self.assertEqual(result["error"]["code"], -32602)
-        self.assertIn("non-empty string", result["error"]["message"])
+        self.assertIn("expected_state_token", result["error"]["message"])
 
     def test_native_visual_proposal_requires_screenshot_from_this_session(self):
         token = server.state_token(self.window, b"pixels")
@@ -634,7 +671,7 @@ class MCPTests(unittest.TestCase):
             for token in (None, "", "   "):
                 args = {"target_pid":4321, "target_window_id":0x1234, "text":"x"}
                 if token is not None: args["expected_state_token"] = token
-                with self.assertRaisesRegex(ValueError, "non-empty expected_state_token"):
+                with self.assertRaisesRegex(ValueError, "expected_state_token"):
                     server.call_tool("type", args)
             execute.assert_not_called()
 
@@ -748,8 +785,10 @@ class NativePortTests(unittest.TestCase):
 
     def test_schema_validation_rejects_missing_unknown_and_wrong_types(self):
         for name in self.native.PROPERTIES:
-            with self.subTest(name=name), self.assertRaises(ValueError):
-                server.call_tool(name, {"unrecognized": True})
+            with self.subTest(name=name):
+                refused = server.call_tool(name, {"unrecognized": True})
+                self.assertTrue(refused["isError"])
+                self.assertIn("unknown argument: unrecognized; accepted: ", refused["content"][0]["text"])
         for name, args in (("click", {"x": True, "y": 1}),
                            ("click", {"x": 1, "y": 1, "delivery_mode": "guess"}),
                            ("click", {"x": 1, "y": 1, "button": "unknown"}),
