@@ -125,6 +125,8 @@ DESCRIPTIONS = {
     "invoke_menu": "Invoke an exact enabled AT-SPI menu path; requires python gi Atspi.",
     "set_value": "Set an unambiguous editable AT-SPI value by role/label; requires python gi Atspi.",
     "start_recording": "Record mutations as turn folders with action, before/after PNG and evidence; optionally capture ffmpeg X11 video.",
+    "clipboard_read": "Read the clipboard; its text is returned only when include_text is true.",
+    "clipboard_write": "Replace the clipboard with exactly one of text, image_path (PNG) or file_path. Paths must be absolute and contain no symlinks.",
     "set_config": "Persist allow_without_activity_check and max_image_dimension (long-edge limit of screenshots, default 1366; 0 keeps the native frame) in ~/.linux-use/config.json.",
     "run_steps": "Run up to 32 tool calls in order in one round trip, stopping at the first that fails, then optionally take one screenshot (observe: the arguments of screenshot). Use it to act and look together: steps:[{tool, arguments}]. Each step is validated, guarded and recorded like its own call; step results are text; a step cannot be run_steps or replay_trajectory.",
     "replay_trajectory": "Replay recorded mutations in order with current human-activity and argument checks; does not bypass stale tokens.",
@@ -514,7 +516,8 @@ def clipboard(s, name, args):
     if not xclip and not xsel:
         raise s.Unsupported("Clipboard requires xclip or xsel.")
     if name == "clipboard_read":
-        if not args.get("include_text", True):
+        # Clipboard text is often private; read it only when asked.
+        if args.get("include_text") is not True:
             return {"text": None}
         data = s.run_cli_bytes("xclip", "-selection", "clipboard", "-o") if xclip else s.run_cli_bytes("xsel", "--clipboard", "--output")
         return {"text": data.decode("utf-8", errors="replace")}
@@ -526,7 +529,12 @@ def clipboard(s, name, args):
     if kind == "text":
         data = args[kind].encode()
     else:
-        path = Path(args[kind]).expanduser().resolve(strict=True)
+        if not os.path.isabs(args[kind]):
+            raise ValueError("Clipboard paths must be absolute.")
+        path = Path(args[kind]).resolve(strict=True)
+        # A symlink anywhere in the path could point the clipboard at a file the caller did not name.
+        if str(path) != os.path.normpath(args[kind]):
+            raise ValueError("Clipboard paths must not pass through symlinks.")
         if not path.is_file():
             raise ValueError("Clipboard path must be a file.")
         if kind == "image_path":

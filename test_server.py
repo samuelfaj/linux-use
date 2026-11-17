@@ -1320,7 +1320,7 @@ class NativePortTests(unittest.TestCase):
 
     def test_clipboard_binary_requires_png_and_xclip(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None):
-            path = Path(directory) / "image.png"
+            path = Path(directory).resolve() / "image.png"
             path.write_bytes(b"not png")
             with self.assertRaisesRegex(ValueError, "PNG"):
                 self.value("clipboard_write", {"image_path": str(path)})
@@ -1359,10 +1359,34 @@ class NativePortTests(unittest.TestCase):
             self.assertEqual(popen.call_args.args[0], ["/usr/bin/xclip", "-selection", "clipboard", "-t", "text/plain;charset=utf-8", "-i"])
             self.assertEqual(popen.return_value.communicate.call_args.args, (b"hello",))
             with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "a b.txt"
+                path = Path(directory).resolve() / "a b.txt"
                 path.write_text("file")
                 self.assertEqual(self.value("clipboard_write", {"file_path": str(path)})["mime_type"], "text/uri-list")
                 self.assertEqual(popen.return_value.communicate.call_args.args, ((path.resolve().as_uri() + "\r\n").encode(),))
+
+    def test_clipboard_write_refuses_relative_and_symlinked_paths(self):
+        # A relative path depends on the server's working directory and a symlink can point at a file
+        # the caller never named; either way the clipboard would carry something else.
+        with tempfile.TemporaryDirectory() as raw, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(server.subprocess, "Popen") as popen:
+            popen.return_value.returncode = 0
+            directory = Path(raw).resolve()
+            (directory / "file").write_text("hello")
+            (directory / "link").symlink_to(directory / "file")
+            (directory / "parent").symlink_to(directory)
+            for path in ("file", "~/file", str(directory / "link"), str(directory / "parent" / "file")):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    self.value("clipboard_write", {"file_path": path})
+            popen.assert_not_called()
+            self.assertEqual(self.value("clipboard_write", {"file_path": str(directory / "file")})["mime_type"], "text/uri-list")
+
+    def test_clipboard_text_is_read_only_when_asked(self):
+        # Clipboard text is often private (a password just copied); listing the clipboard must not leak it.
+        with patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xclip" if name == "xclip" else None), patch.object(
+            server, "run_cli_bytes", return_value=b"secret"
+        ) as read:
+            self.assertEqual(self.value("clipboard_read"), {"text": None})
+            read.assert_not_called()
+            self.assertEqual(self.value("clipboard_read", {"include_text": True}), {"text": "secret"})
 
     def test_optional_video_uses_x11grab_and_stops_owned_process(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None), patch.object(server.subprocess, "Popen") as popen:
