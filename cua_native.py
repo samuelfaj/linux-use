@@ -92,7 +92,7 @@ MUTATIONS = set(PROPERTIES) - READ_ONLY
 LEGACY_MUTATIONS = {"restore_window", "left_click", "type", "key", "scroll", "click_element",
                     "native_visual_execute", "browser_open", "browser_act", "browser_close"}
 DESCRIPTIONS = {
-    "verify_state": "Verify exact window conditions or 1-8 text criteria (200 characters each). Prefer this cheap text-only Jev check before screenshots; browser:true uses owned Chrome labels, otherwise window title and optional AT-SPI labels. No Jev credentials returns unknown with filtered evidence.",
+    "verify_state": "Verify exact window conditions, AT-SPI element checks (element_exists, element_value, focused_element) or 1-8 natural-language criteria (200 characters each), judged by the decision model (liquid/d1.2-ultra, Jev on fallback). browser:true uses owned Chrome labels only; otherwise the window title, AT-SPI labels and, for one window, its screenshot (1024 px; none with a password field). Each criterion reports probability, engine and image_attached. No key returns unknown with filtered evidence.",
     "list_apps": "List X11 window-owning processes and installed desktop applications.",
     "launch_app": "Launch exactly one name, desktop_id, or command detached without activating its windows; return PID and new windows.",
     "get_accessibility_tree": "X11 desktop window summary with geometry, stacking order and active window; not an AT-SPI element tree.",
