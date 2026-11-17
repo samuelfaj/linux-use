@@ -1159,6 +1159,8 @@ class BrowserPortTests(unittest.TestCase):
         field.get_text.assert_not_called()
         with patch.object(server.cua_native.importlib, "import_module", side_effect=[gi, atspi]), patch.object(
             server, "list_windows", return_value=[self.window]
+        ), patch.object(server.atspi_tree, "snapshot", side_effect=server.Unsupported("no AT-SPI tree")), patch.object(
+            server, "decision_image", return_value=(None, "capture_unavailable")
         ), patch.object(server, "jev_route", return_value=True), patch.object(
             server, "jev_evaluate", return_value={"answers": {"criterion_0": {"noul": 0.9}}}
         ) as evaluate:
@@ -1291,3 +1293,128 @@ class DecisionRoutingTests(unittest.TestCase):
             image, text = call["body"]["state"]
             self.assertEqual(image, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
             self.assertIn("Click Save", text)
+
+
+class AtspiTreeTests(unittest.TestCase):
+    """The AT-SPI layer: ids that keep meaning their element, secure fields never read, decisions over it."""
+
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def setUp(self):
+        server.atspi_tree.STORE.clear()
+
+    @staticmethod
+    def item(index, role, name="", parent=None, states=(), actions=(), value=None, depth=0):
+        accessible = type("Accessible", (), {})()
+        accessible.get_role_name = lambda: role
+        accessible.get_name = lambda: name
+        accessible.get_description = lambda: ""
+        return {"id": f"ax_{index}", "role": role, "name": name, "description": "", "value": value,
+                "states": list(states), "actions": list(actions), "depth": depth, "parent": parent, "accessible": accessible}
+
+    def form(self):
+        return [self.item(0, "frame", "Form"), self.item(1, "filler", parent="ax_0"),
+                self.item(2, "label", "Status: Ready", parent="ax_1"), self.item(3, "filler", parent="ax_1"),
+                self.item(4, "label", "Wi-Fi", parent="ax_3"), self.item(5, "toggle button", parent="ax_3", states=["checked"], actions=["toggle"]),
+                self.item(6, "button", "Save", parent="ax_1", actions=["click"]),
+                self.item(7, "button", "Delete draft", parent="ax_1", actions=["click"])]
+
+    def test_rows_fold_unnamed_wrappers_and_a_query_keeps_ancestors(self):
+        rows = server.atspi_tree.render_rows(self.form())
+        # A single-child wrapper says nothing; folding it keeps the tree short for the model reading it.
+        self.assertEqual(rows.splitlines()[:3], ['- [ax_0] frame "Form"', "  - [ax_1] filler", '    - [ax_2] label "Status: Ready"'])
+        self.assertIn('- [ax_5] toggle button {checked} [toggle]', rows)
+        query = server.atspi_tree.render_rows(self.form(), query="save|status")
+        self.assertEqual(query.splitlines(), ['- [ax_0] frame "Form"', "  - [ax_1] filler",
+                                              '    - [ax_2] label "Status: Ready"', '    - [ax_6] button "Save" [click]'])
+        capped = server.atspi_tree.render_rows(self.form(), max_elements=2)
+        self.assertIn("more rows", capped.splitlines()[-1])
+
+    def test_an_id_keeps_meaning_its_element_until_it_changes(self):
+        nodes = self.form()
+        token = server.atspi_tree.remember(self.window, nodes)
+        self.assertIs(server.atspi_tree.resolve(server, self.window, "ax_6", token), nodes[6]["accessible"])
+        nodes[6]["accessible"].get_name = lambda: "Send"  # Same slot, different control: never press it.
+        with self.assertRaisesRegex(server.Unsupported, "stale_state_token"):
+            server.atspi_tree.resolve(server, self.window, "ax_6", token)
+        with self.assertRaisesRegex(server.Unsupported, "not in that read"):
+            server.atspi_tree.resolve(server, self.window, "ax_99", token)
+
+    def test_only_the_last_eight_reads_are_kept(self):
+        tokens = [server.atspi_tree.remember(self.window, self.form()) for _ in range(9)]
+        with self.assertRaisesRegex(server.Unsupported, "stale_state_token"):
+            server.atspi_tree.resolve(server, self.window, "ax_6", tokens[0])
+        server.atspi_tree.resolve(server, self.window, "ax_6", tokens[-1])
+
+    def test_a_secure_field_is_never_read(self):
+        atspi = type("Atspi", (), {})()
+        node = type("Node", (), {"get_text_iface": lambda self: self})()
+        atspi.Text = type("Text", (), {"get_character_count": staticmethod(lambda node: 7),
+                                         "get_text": staticmethod(lambda node, start, end: "hunter2")})
+        self.assertIsNone(server.atspi_tree._value(atspi, node, "password text"))
+        self.assertEqual(server.atspi_tree._value(atspi, node, "text"), "hunter2")
+
+    def test_switch_without_a_name_is_labelled_by_the_text_beside_it(self):
+        labels = {item["id"]: label for item, label in server.atspi_tree.actionable(self.form())}
+        self.assertEqual(labels, {"ax_5": "Wi-Fi", "ax_6": "Save", "ax_7": "Delete draft"})
+
+    def decide(self, nodes, *, route=("key", "endpoint", "model", None), image=("data:image/png;base64,AAAA", None)):
+        args = {"goal": "Save the form", "target_pid": 77, "target_window_id": 4194311}
+        answer = {"answers": {"next": {"choice": "e1", "probabilities": {"e0": 0.0, "e1": 1.0, "WAIT": 0.0, "DONE": 0.0, "BLOCKED": 0.0},
+                                       "confidence": 0.95},
+                              "complete": {"noul": 0.0}, "consequential": {"noul": 0.0}, "authorized": {"noul": 0.0}},
+                  "engine": "liquid/d1.2-ultra-20261116"}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server.cua_native, "human_guard"), patch.object(
+            server.atspi_tree, "snapshot", return_value=("ax-token", nodes)
+        ), patch.object(server, "jev_route", return_value=route), patch.object(
+            server, "decision_image", return_value=image
+        ) as capture, patch.object(server, "jev_evaluate", return_value=answer) as evaluate:
+            result = json.loads(server.call_tool("jev_decide", args)["content"][0]["text"])
+        return result, capture, evaluate
+
+    def test_native_decision_reads_the_window_image_with_its_controls(self):
+        result, capture, evaluate = self.decide(self.form())
+        self.assertEqual((result["operation"], result["label"], result["element_id"]), ("click_element", "Save", "ax_6"))
+        self.assertEqual((result["expected_state_token"], result["image_attached"]), ("ax-token", True))
+        image, text = evaluate.call_args.args[0]["state"]
+        self.assertEqual(image["image_url"]["url"], "data:image/png;base64,AAAA")
+        # The risky control is withheld from the model unless the goal allowed its category.
+        self.assertIn("Wi-Fi", text)
+        self.assertNotIn("Delete draft", text)
+
+    def test_native_decision_never_captures_a_window_with_a_secure_field(self):
+        nodes = self.form() + [self.item(8, "password text", "Password", parent="ax_1")]
+        result, capture, evaluate = self.decide(nodes)
+        capture.assert_not_called()
+        self.assertEqual((result["image_attached"], result["image_skip_reason"]), (False, "secure_field"))
+        self.assertIsInstance(evaluate.call_args.args[0]["state"], dict)
+
+    def test_native_decision_without_a_key_hands_element_ids_to_the_session_llm(self):
+        result, capture, evaluate = self.decide(self.form(), route=None)
+        evaluate.assert_not_called()
+        capture.assert_not_called()
+        self.assertEqual((result["mode"], result["operation"], result["expected_state_token"]), ("llm", "DEFER_TO_LLM", "ax-token"))
+        self.assertIn({"operation": "click_element", "element_id": "ax_6", "role": "button", "label": "Save"}, result["candidates"])
+        self.assertNotIn("Delete draft", json.dumps(result))
+
+    def test_verify_sends_the_window_image_and_a_model_error_is_unknown_not_a_failed_call(self):
+        def verify(evaluate_effect):
+            with patch.dict(os.environ, {"DISPLAY": ":99", "XDG_SESSION_TYPE": "x11"}), patch.object(
+                server, "list_windows", return_value=[self.window]
+            ), patch.object(
+                server.cua_native, "jev_window_labels", return_value=[{"role": "button", "label": "Save"}]
+            ), patch.object(server.atspi_tree, "snapshot", return_value=("ax-token", self.form())), patch.object(
+                server, "decision_image", return_value=("data:image/png;base64,AAAA", None)
+            ), patch.object(server, "jev_route", return_value=("key", "endpoint", "model", None)), patch.object(
+                server, "jev_evaluate", side_effect=evaluate_effect
+            ) as evaluate:
+                result = server.call_tool("verify_state", {"window_id": self.window["window_id"], "expect": {"criteria": ["Wi-Fi is on"]}})
+            return json.loads(result["content"][0]["text"]), evaluate
+        result, evaluate = verify([{"answers": {"criterion_0": {"noul": 0.97}}, "engine": "liquid/d1.2-ultra-20261116"}])
+        criterion = result["criteria"][0]
+        self.assertEqual((criterion["status"], criterion["probability"], criterion["image_attached"]), ("pass", 0.97, True))
+        self.assertEqual(criterion["engine"], "liquid/d1.2-ultra-20261116")
+        self.assertIsInstance(evaluate.call_args.args[0]["state"], list)
+        result, _ = verify(server.Unsupported("Decision request failed (unreachable)"))
+        self.assertEqual(result["criteria"][0]["status"], "unknown")
+        self.assertIn("unreachable", result["criteria"][0]["reason"])
