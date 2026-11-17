@@ -608,7 +608,7 @@ def _call_tool(name, args):
             if not isinstance(coordinate, list) or len(coordinate) != 2 or any(type(v) is not int for v in coordinate):
                 raise ValueError("coordinate must be [x, y] integer pixels of the screenshot or zoom image.")
             x, y = cua_native.to_window(window, *coordinate, token_view(args["expected_state_token"], window))
-            commands.append(["xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y)])
+            commands.append(["xdotool", "mousemove", "--window", wid, str(x), str(y)])
         if name == "left_click":
             commands.append(["xdotool", "click", "--window", wid, "1"])
         elif name == "type":

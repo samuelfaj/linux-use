@@ -446,15 +446,15 @@ def input_action(s, name, args):
         modifiers = keys(args["modifier"]) if args.get("modifier") else []
         button = {"left": "1", "middle": "2", "right": "3"}["right" if name == "right_click" else args.get("button", "left")]
         count = 2 if name == "double_click" else args.get("count", 1)
-        commands.append(["xdotool", "mousemove", "--sync", "--window", wid, x, y])
+        commands.append(["xdotool", "mousemove", "--window", wid, x, y])
         commands.append(["xdotool", "click", *([] if foreground else ["--window", wid]), "--repeat", str(count), "--delay", "100", button])
     elif name == "drag":
         start = position(args, window, "from_x", "from_y", view)
         end = position(args, window, "to_x", "to_y", view)
         destination = [] if foreground else ["--window", wid]
-        commands = [["xdotool", "mousemove", "--sync", "--window", wid, *start],
+        commands = [["xdotool", "mousemove", "--window", wid, *start],
                     ["xdotool", "mousedown", *destination, "1"],
-                    ["xdotool", "mousemove", "--sync", "--window", wid, *end],
+                    ["xdotool", "mousemove", "--window", wid, *end],
                     ["xdotool", "mouseup", *destination, "1"]]
     elif name == "type_text":
         if not args["text"]:
@@ -990,7 +990,7 @@ def dispatch(s, name, args):
             if not (0 <= x < size["width"] and 0 <= y < size["height"]):
                 raise ValueError("Coordinates are outside the desktop.")
             human_guard(s, args, all_windows=True)
-            inject(s, "xdotool", "mousemove", "--sync", str(x), str(y))
+            inject(s, "xdotool", "mousemove", str(x), str(y))
         CURSOR.update(x=x, y=y, scope=scope)
         return {**overlay_update(), "physical_pointer_moved": scope == "desktop"}
     if name in ("click", "double_click", "right_click", "drag", "type_text", "press_key", "hotkey"):

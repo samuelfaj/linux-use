@@ -639,11 +639,11 @@ class MCPTests(unittest.TestCase):
             for name, args in (("left_click", {"coordinate":[10, 20]}), ("type", {"text":"hello"}), ("key", {"key":"Return"}), ("scroll", {"coordinate":[10, 20], "delta_y":2})):
                 server.call_tool(name, {**args, "target_pid":4321, "target_window_id":0x1234, "expected_state_token":token})
             self.assertEqual(execute.call_count, 6)
-            self.assertEqual(execute.call_args_list[0].args, ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"))
+            self.assertEqual(execute.call_args_list[0].args, ("xdotool", "mousemove", "--window", "0x1234", "10", "20"))
             self.assertEqual(execute.call_args_list[1].args, ("xdotool", "click", "--window", "0x1234", "1"))
             self.assertEqual(execute.call_args_list[2].args[-1], "hello")
             self.assertEqual(execute.call_args_list[3].args[-1], "Return")
-            self.assertEqual(execute.call_args_list[4].args[:6], ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10"))
+            self.assertEqual(execute.call_args_list[4].args[:5], ("xdotool", "mousemove", "--window", "0x1234", "10"))
             self.assertIn("--window", execute.call_args_list[5].args)
 
     def test_visual_change_makes_screenshot_token_stale_before_input(self):
@@ -881,7 +881,7 @@ class NativePortTests(unittest.TestCase):
         self.assertNotIn("took_focus", result)
         self.assertEqual([call.args for call in run.call_args_list], [
             ("xdotool", "getactivewindow"),
-            ("xdotool", "mousemove", "--sync", "--window", "0x1234", "10", "20"),
+            ("xdotool", "mousemove", "--window", "0x1234", "10", "20"),
             ("xdotool", "click", "--window", "0x1234", "--repeat", "1", "--delay", "100", "1"),
             ("xdotool", "getactivewindow")])
 
@@ -2231,3 +2231,12 @@ class ElementCheckTests(unittest.TestCase):
         big = nodes + [item(index, "label", f"row {index}", parent="ax_0") for index in range(3, server.atspi_tree.MAX_NODES)]
         result = self.check({"element_exists": {"role": "button", "label": "Send"}}, big)
         self.assertEqual(result["status"], "unknown")
+
+
+class PointerMoveTests(unittest.TestCase):
+    def test_pointer_moves_never_wait_for_motion(self):
+        # xdotool mousemove --sync never returns when the pointer is already at the destination, so a second
+        # click on the same spot hung until its timeout without clicking. Nothing may ask for --sync.
+        for path in (Path(server.__file__), Path(server.cua_native.__file__)):
+            self.assertNotIn('"--sync"', path.read_text(encoding="utf-8"), path.name)
+
