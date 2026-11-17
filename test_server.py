@@ -35,6 +35,10 @@ class MCPTests(unittest.TestCase):
         idle_check = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         idle_check.start()
         self.addCleanup(idle_check.stop)
+        # Whether xprop is installed must not change which X11 calls a test sees; minimized windows have their own tests.
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"
@@ -731,11 +735,61 @@ class MCPTests(unittest.TestCase):
         with self.assertRaises(ValueError): server.install_host("bad")
 
     def test_list_windows_discards_wmctrl_hostname_column(self):
-        row = "0x01234567  0  4321  10  20  800  600  workstation.example  Editor - document.txt"
-        with patch.object(server, "run_cli", return_value=row):
+        row = "0x01234567  0  4321  10  20  800  600  editor.Editor  workstation.example  Editor - document.txt"
+        with patch.object(server, "run_cli", return_value=row) as run:
             windows = server.list_windows()
+        run.assert_called_once_with("wmctrl", "-lpGx")
         self.assertEqual(windows[0]["window_id"], 0x01234567)
         self.assertEqual(windows[0]["title"], "Editor - document.txt")
+        self.assertEqual(windows[0]["wm_class"], "editor.Editor")
+
+    def test_list_windows_filters_by_wm_class_and_reports_minimized_and_on_screen(self):
+        # bundle_id was refused outright on Linux, and nothing said a window was minimized or on
+        # another desktop, so callers screenshotted windows that had no pixels.
+        windows = [{**self.window, "wm_class": "gedit.Gedit"},
+                   {**self.window, "window_id": 0x2, "desktop": "1", "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x3, "wm_class": "app.py.App.py"},
+                   {**self.window, "window_id": 0x4, "desktop": "-1", "wm_class": "conky.Conky"}]
+        with patch.object(server, "list_windows", side_effect=lambda: [dict(w) for w in windows]), patch.object(
+            server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"
+        ), patch.object(server, "run_cli", return_value="_NET_CURRENT_DESKTOP(CARDINAL) = 0"), patch.object(
+            server, "window_minimized", side_effect=lambda wid: wid == 0x3
+        ):
+            listed = json.loads(server.call_tool("list_windows", {})["content"][0]["text"])
+            self.assertEqual([(w["window_id"], w["is_minimized"], w["is_on_screen"]) for w in listed],
+                             [(0x1234, False, True), (0x2, False, False), (0x3, True, False), (0x4, False, True)])
+            for wanted, ids in (("Gedit", [0x1234]), ("gedit.Gedit", [0x1234]), ("app.py", [0x2, 0x3]), ("App.py", [0x2, 0x3]), ("py", [])):
+                with self.subTest(bundle_id=wanted):
+                    listed = json.loads(server.call_tool("list_windows", {"bundle_id": wanted})["content"][0]["text"])
+                    self.assertEqual([w["window_id"] for w in listed], ids)
+
+    def test_minimized_window_refuses_pixel_tools_and_says_how_to_restore_it(self):
+        # xwd of a minimized window fails with an X error that says nothing useful, and input to it is
+        # lost. Pixel tools refuse with a hint and a token restore_window accepts, which brings it back.
+        token = server.state_token(self.window, b"pixels")
+        hidden = [True]
+        def x11(*args):
+            if args[:2] == ("wmctrl", "-ia"):
+                hidden[0] = False  # activation de-iconifies, as window managers do
+            return "0x1234" if args[1] == "getwindowfocus" else ""
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "window_minimized", side_effect=lambda wid: hidden[0]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels") as capture, patch.object(server, "run_cli", side_effect=x11) as execute:
+            for name, args in (("screenshot", {}), ("zoom", {"region": [0, 0, 10, 10]}),
+                               ("type", {"expected_state_token": token, "text": "x"}),
+                               ("left_click", {"expected_state_token": token, "coordinate": [1, 1]})):
+                with self.subTest(name=name), self.assertRaisesRegex(server.Unsupported, "minimized.*restore_window") as refused:
+                    server.call_tool(name, {"target_pid": 4321, "target_window_id": 0x1234, **args})
+            capture.assert_not_called()
+            execute.assert_not_called()
+            restore_token = str(refused.exception).rsplit("state_token: ", 1)[1]
+            # The window manager maps the window a moment after it takes focus; xwd fails until then.
+            capture.side_effect = [server.Unsupported("xwd: BadMatch"), b"pixels"]
+            with patch.object(server.time, "sleep"):
+                restored = json.loads(server.call_tool("restore_window", {"target_pid": 4321, "target_window_id": 0x1234,
+                                                                          "expected_state_token": restore_token})["content"][0]["text"])
+        self.assertTrue(restored["restored"])
+        self.assertEqual(execute.call_args_list[0].args, ("wmctrl", "-ia", "0x1234"))
 
 
 class NativePortTests(unittest.TestCase):
@@ -758,6 +812,9 @@ class NativePortTests(unittest.TestCase):
         utilities = patch.object(server.shutil, "which", side_effect=lambda name: None if name == "xprintidle" else which(name))
         utilities.start()
         self.addCleanup(utilities.stop)
+        shown = patch.object(server, "window_minimized", return_value=False)
+        shown.start()
+        self.addCleanup(shown.stop)
         config_dir = tempfile.TemporaryDirectory()
         self.addCleanup(config_dir.cleanup)
         config_path = Path(config_dir.name) / "config.json"

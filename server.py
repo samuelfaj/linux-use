@@ -56,16 +56,42 @@ def x11_available():
 def list_windows():
     if not os.environ.get("DISPLAY") or os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
         raise Unsupported("Linux native controls require an X11 DISPLAY; Wayland is unsupported.")
-    lines = run_cli("wmctrl", "-lpG").splitlines()
+    lines = run_cli("wmctrl", "-lpGx").splitlines()
     windows = []
     for line in lines:
-        fields = line.split(None, 8)
-        if len(fields) < 9:
+        fields = line.split(None, 9)
+        if len(fields) < 10:
             continue
-        wid, desktop, pid, x, y, width, height, _host, title = fields
+        wid, desktop, pid, x, y, width, height, wm_class, _host, title = fields
         windows.append({"window_id": int(wid, 16), "pid": int(pid), "desktop": desktop,
-                        "geometry": [int(x), int(y), int(width), int(height)], "title": title})
+                        "geometry": [int(x), int(y), int(width), int(height)], "title": title, "wm_class": wm_class})
     return windows
+
+
+def wm_class_matches(wm_class, wanted):
+    """Whether bundle_id names this WM_CLASS whole, its instance or its class. wmctrl joins them with a dot;
+    split where the halves agree ("app.py.App.py"), else at the first dot ("Navigator.firefox")."""
+    dots = [i for i, char in enumerate(wm_class) if char == "."]
+    split = next((i for i in dots if wm_class[:i].casefold() == wm_class[i + 1:].casefold()), dots[0] if dots else len(wm_class))
+    return wanted.casefold() in {wm_class.casefold(), wm_class[:split].casefold(), wm_class[split + 1:].casefold()}
+
+
+def window_minimized(window_id):
+    """True when the window manager hides (minimizes) the window; None when xprop cannot tell."""
+    if not shutil.which("xprop"):
+        return None
+    try:
+        return "_NET_WM_STATE_HIDDEN" in run_cli("xprop", "-id", hex(window_id), "_NET_WM_STATE")
+    except Unsupported:
+        return None
+
+
+def require_renderable(window, name):
+    """A minimized window has no pixels to read or click; say how to get them back."""
+    if window_minimized(window["window_id"]):
+        raise Unsupported(f"pixel_target_not_renderable: the window is minimized, so {name} has no pixels to act on. "
+                          "Hint: call restore_window with this state_token first, or use the AT-SPI tools. "
+                          f"state_token: {state_token(window)}")
 
 
 TOKEN_PREFIX = "x11-pixel-v1:"
@@ -123,6 +149,8 @@ def verified_target(args, require_token=False, verify_screenshot=False):
     window = matches[0]
     if supplied is not None and token_view(supplied, window) is None:
         raise Unsupported("Target state token is stale; refresh the target state before acting. " + cua_native.STALE_HINT)
+    if verify_screenshot:
+        require_renderable(window, "this tool")
     screenshot = screenshot_png(window["window_id"]) if verify_screenshot else None
     return window, state_token(window, screenshot)
 
@@ -254,7 +282,7 @@ BROWSER_DESCRIPTIONS = {
 def descriptions(name):
     if name in BROWSER_DESCRIPTIONS: return BROWSER_DESCRIPTIONS[name]
     if name in cua_native.PROPERTIES: return cua_native.description(name)
-    if name == "list_windows": return "List X11 windows using wmctrl. Linux session must be X11, not Wayland."
+    if name == "list_windows": return "List X11 windows using wmctrl with WM_CLASS (wm_class), is_minimized and is_on_screen; bundle_id filters by WM_CLASS instance or class. Linux session must be X11, not Wayland."
     if name == "doctor": return "Report X11 and system utility availability; no permissions are changed."
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
     if name == "browser_open": return "Open an HTTP(S) URL in an owned Chrome background tab. Always call browser_close on this same connection when finished or on error, before another open."
@@ -393,9 +421,14 @@ def _call_tool(name, args):
                                             and not ((x.startswith("browser_") or x == "page") and browser_available)
                                             and not (x == "jev_decide" and jev_available)]})
     if name == "list_windows":
-        if args.get("bundle_id"):
-            raise Unsupported("bundle_id filtering is not available on Linux; use target PID/window ID from the returned list.")
-        return text_result(list_windows())
+        windows = [w for w in list_windows() if not args.get("bundle_id") or wm_class_matches(w["wm_class"], args["bundle_id"])]
+        current = re.search(r"=\s*(\d+)", run_cli("xprop", "-root", "_NET_CURRENT_DESKTOP")) if shutil.which("xprop") else None
+        for window in windows:
+            window["is_minimized"] = window_minimized(window["window_id"])
+            # Sticky windows (desktop -1) show on every desktop.
+            on_desktop = None if current is None else window["desktop"] in (current[1], "-1")
+            window["is_on_screen"] = None if None in (on_desktop, window["is_minimized"]) else on_desktop and not window["is_minimized"]
+        return text_result(windows)
     if name == "browser_download":
         return text_result(browser_download(args))
     if name.startswith("browser_") or name == "page":
@@ -414,7 +447,8 @@ def _call_tool(name, args):
     if name == "browser_close":
         return text_result(browser_request(name, args), error=False)
     if name == "restore_window":
-        window, _ = verified_target(args, require_token=True, verify_screenshot=True)
+        # No capture first: restoring is how a minimized window gets its pixels back.
+        window, _ = verified_target(args, require_token=True)
         run_cli("wmctrl", "-ia", hex(window["window_id"]))
         focused = run_cli("xdotool", "getwindowfocus").strip()
         try:
@@ -423,12 +457,21 @@ def _call_tool(name, args):
             raise Unsupported("Could not verify the focused X11 window; no further action was performed.") from exc
         if focused_id != window["window_id"]:
             raise Unsupported("Window manager did not focus the requested window; no further action was performed. " + cua_native.FOCUS_HINT)
-        restored, token = verified_target({"target_pid": window["pid"], "target_window_id": window["window_id"]}, verify_screenshot=True)
+        # A de-iconified window is mapped a moment after it takes focus; give it up to a second to render.
+        for attempt in range(10):
+            try:
+                restored, token = verified_target({"target_pid": window["pid"], "target_window_id": window["window_id"]}, verify_screenshot=True)
+                break
+            except Unsupported:
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
         return text_result({"restored": True, "window_id": restored["window_id"], "state_token": token,
                             "instruction": "Use this fresh state token for the next action."})
     if name in ("screenshot", "zoom"):
         target_args = {key: value for key, value in args.items() if key != "expected_state_token"}
         window, _ = verified_target(target_args)
+        require_renderable(window, name)
         width, height = window["geometry"][2:]
         region = None
         if name == "zoom":
