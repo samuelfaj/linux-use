@@ -1,11 +1,17 @@
 import json
 import os
 import fcntl
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 import server
+
+
+def png(width, height, tag=b""):
+    """The first bytes of a PNG of this size: enough for the server to read its IHDR."""
+    return b"\x89PNG\r\n\x1a\n" + struct.pack(">I4sII", 13, b"IHDR", width, height) + tag
 
 
 class MCPTests(unittest.TestCase):
@@ -16,6 +22,7 @@ class MCPTests(unittest.TestCase):
         server.NATIVE_VISUAL_OBSERVATIONS.clear()
         server.cua_native.AGENT_INPUT["at"] = float("-inf")
         server.CAPTURE["stalled_until"] = float("-inf")
+        server.cua_native.SCREENSHOTS.clear()
         self.env = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -492,6 +499,61 @@ class MCPTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "PNG conversion requires ImageMagick"):
                 server.screenshot_png(0x1234)
 
+    def test_clicks_read_from_a_scaled_screenshot_land_on_the_same_place_in_the_window(self):
+        # A 1920x1080 window is given to the caller as 1366x768 and it picks pixels in that image;
+        # read as window pixels they landed up and to the left, on other controls. The result must
+        # also say what size the pixels are measured in.
+        window = {**self.window, "geometry": [0, 0, 1920, 1080]}
+        with patch.object(server, "list_windows", return_value=[window]), patch.object(
+            server, "screenshot_png", return_value=png(1366, 768)
+        ) as capture, patch.object(server, "run_cli") as execute:
+            shot = server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            seen = json.loads(shot["content"][1]["text"])
+            self.assertEqual((seen["image_size"], seen["window_size"]), ([1366, 768], [1920, 1080]))
+            self.assertEqual(capture.call_args.args, (0x1234, None), "None means the configured limit")
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": seen["state_token"]}
+            server.call_tool("left_click", {**base, "coordinate": [683, 384]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("960", "540"))
+            # A pixel outside the image the caller holds is refused rather than clamped.
+            execute.reset_mock()
+            with self.assertRaisesRegex(ValueError, "1366x768"):
+                server.call_tool("left_click", {**base, "coordinate": [1400, 10]})
+            execute.assert_not_called()
+            # The cua click takes pixels of the last screenshot too.
+            server.call_tool("click", {"window_id": 0x1234, "x": 683, "y": 384})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("960", "540"))
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": 0})
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            with self.assertRaises(ValueError):
+                server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234, "max_image_dimension": -1})
+
+    def test_zoom_returns_a_native_crop_whose_pixels_map_into_the_region(self):
+        # zoom was always unsupported, so small text could only be read from the scaled screenshot.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(200, 100)
+        ) as capture, patch.object(server, "run_cli") as execute:
+            zoom = server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": [400, 300, 200, 100]})
+            seen = json.loads(zoom["content"][1]["text"])
+            self.assertEqual(capture.call_args.args, (0x1234, 0))
+            self.assertEqual(capture.call_args.kwargs, {"crop": [400, 300, 200, 100]})
+            self.assertEqual((seen["image_size"], seen["region"]), ([200, 100], [400, 300, 200, 100]))
+            server.call_tool("left_click", {"target_pid": 4321, "target_window_id": 0x1234,
+                                            "expected_state_token": seen["state_token"], "coordinate": [10, 20]})
+            self.assertEqual(execute.call_args_list[0].args[-2:], ("410", "320"))
+            for region in ([700, 0, 200, 100], [0, 0, 0, 10], [-1, 0, 10, 10], [0, 0, 10]):
+                with self.subTest(region=region), self.assertRaises(ValueError):
+                    server.call_tool("zoom", {"target_pid": 4321, "target_window_id": 0x1234, "region": region})
+
+    def test_capture_resizes_to_the_limit_unless_native_or_cropped(self):
+        with patch.object(server.shutil, "which", side_effect=lambda name: f"/usr/bin/{name}"), patch.object(
+            server, "run_cli_bytes", return_value=b"png"
+        ) as run:
+            for dimension, crop, options in ((None, None, ["-resize", "1366x1366>"]), (900, None, ["-resize", "900x900>"]),
+                                             (0, None, []), (0, [5, 6, 20, 10], ["-crop", "20x10+5+6", "+repage"])):
+                with self.subTest(dimension=dimension, crop=crop):
+                    server.screenshot_png(0x1234, dimension, crop=crop)
+                    self.assertEqual(list(run.call_args.args), ["/usr/bin/convert", "xwd:-", *options, "png:-"])
+
     def test_one_deadline_bounds_the_capture_and_a_stall_then_fails_fast(self):
         # xwd and the conversion each had their own 8 s timeout, so an X server that stopped answering
         # cost 16 s on every call. One 12 s deadline covers the whole capture, and after a stall
@@ -646,6 +708,7 @@ class NativePortTests(unittest.TestCase):
         self.native.DISPATCH_DEPTH = 0
         self.native.VIDEO = None
         self.native.AGENT_INPUT["at"] = float("-inf")
+        self.native.SCREENSHOTS.clear()
         environment = patch.dict(os.environ, {"DISPLAY": ":1", "XDG_SESSION_TYPE": "x11"})
         environment.start()
         self.addCleanup(environment.stop)
@@ -687,7 +750,7 @@ class NativePortTests(unittest.TestCase):
                            ("click", {"x": 1, "y": 1, "button": "unknown"}),
                            ("click", {"x": 1, "y": 1, "count": 0}),
                            ("click", {"x": 1, "y": 1, "modifier": [1]}),
-                           ("set_config", {"max_image_dimension": 0}),
+                           ("set_config", {"max_image_dimension": -1}),
                            ("set_config", {"max_image_dimension": 16385}),
                            ("type_text", {"text": "bad\x00text"}),
                            ("launch_app", {"urls": "not-array"}),
@@ -725,6 +788,24 @@ class NativePortTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "stale"):
                 self.value("click", {"window_id": 0x1234, "x": 1, "y": 2, "expected_state_token": token})
             run.assert_not_called()
+
+    def test_screenshot_scale_holds_only_while_the_window_keeps_its_size(self):
+        # Click pixels are read from the image the caller was given. Once the window is resized
+        # that image no longer maps onto it, and x,y are taken as window pixels again.
+        big = {**self.window, "geometry": [0, 0, 1600, 1000]}
+        live = [big]
+        with patch.object(server, "list_windows", side_effect=lambda: list(live)), patch.object(
+            server, "screenshot_png", return_value=png(800, 500)
+        ), patch.object(server, "run_cli") as run:
+            server.call_tool("screenshot", {"target_pid": 4321, "target_window_id": 0x1234})
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(run.call_args_list[0].args[-2:], ("201", "101"))
+            with self.assertRaises(ValueError):
+                self.value("click", {"window_id": 0x1234, "x": 800, "y": 0})
+            live[0] = {**big, "geometry": [0, 0, 1200, 900]}
+            run.reset_mock()
+            self.value("click", {"window_id": 0x1234, "x": 100, "y": 50})
+            self.assertEqual(run.call_args_list[0].args[-2:], ("100", "50"))
 
     def test_click_foreground_activates_clicks_and_restores(self):
         def cli(*args):
@@ -900,7 +981,10 @@ class NativePortTests(unittest.TestCase):
 
     def test_config_round_trip_and_invalid_values_do_not_overwrite(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "CONFIG_PATH", Path(directory) / "config.json"), patch.object(self.native, "human_guard"):
-            self.assertEqual(self.value("get_config")["max_image_dimension"], 1920)
+            # 1366 by default: clients resize larger images by an amount the caller cannot know.
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 1366)
+            self.value("set_config", {"max_image_dimension": 0})
+            self.assertEqual(self.value("get_config")["max_image_dimension"], 0, "0 keeps the native frame")
             self.value("set_config", {"max_image_dimension": 1024})
             self.assertEqual(self.value("get_config"), {"max_image_dimension": 1024, "allow_without_activity_check": False})
             with self.assertRaises(ValueError):
@@ -1055,7 +1139,7 @@ class NativePortTests(unittest.TestCase):
             result = server.call_tool("get_desktop_state", {})
             self.assertEqual(result["content"][0]["type"], "image")
             self.assertEqual(run.call_args_list[0].args, ("xwd", "-silent", "-root"))
-            self.assertIn("1920x1920>", run.call_args_list[1].args)
+            self.assertIn("1366x1366>", run.call_args_list[1].args)
 
     def test_clipboard_binary_requires_png_and_xclip(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(server.shutil, "which", side_effect=lambda name: "/usr/bin/xsel" if name == "xsel" else None):

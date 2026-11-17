@@ -74,7 +74,7 @@ def png_size(data):
     return None
 
 
-def state_token(window, screenshot=None):
+def state_token(window, screenshot=None, region=None):
     """The window's identity and frame and, for a screenshot, the size of the image the caller holds.
     Pixel coordinates depend on the frame they were read from, not on what was drawn in it (a caret,
     a clock); the pixel digest is carried for information only."""
@@ -82,6 +82,8 @@ def state_token(window, screenshot=None):
                 "geometry": list(window["geometry"])}
     if screenshot is not None:
         envelope.update(image_size=png_size(screenshot), pixels_sha256=hashlib.sha256(screenshot).hexdigest())
+        if region:
+            envelope["region"] = list(region)
     encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode()
     return TOKEN_PREFIX + base64.urlsafe_b64encode(encoded).decode("ascii")
 
@@ -138,8 +140,9 @@ CAPTURE_RETRY_SECONDS = 30
 CAPTURE = {"stalled_until": float("-inf")}
 
 
-def capture_png(source, dimension=None):
-    """xwd of `source` (["-id", window] or ["-root"]) as PNG, its long edge limited to `dimension`."""
+def capture_png(source, dimension=None, crop=None):
+    """xwd of `source` (["-id", window] or ["-root"]) as PNG, its long edge limited to `dimension`
+    (0 keeps the native frame), or the native-resolution `crop` [x, y, width, height]."""
     now = time.monotonic()
     if now < CAPTURE["stalled_until"]:
         raise Unsupported(f"screen_capture_stalled: a capture did not finish in {CAPTURE_SECONDS} s; "
@@ -152,7 +155,11 @@ def capture_png(source, dimension=None):
             raise Unsupported("Unsupported/unavailable: screenshot PNG conversion requires ImageMagick 'convert' or 'magick'.")
         if dimension is None:
             dimension = cua_native.get_config(sys.modules[__name__])["max_image_dimension"]
-        return run_cli_bytes(converter, "xwd:-", "-resize", f"{dimension}x{dimension}>", "png:-", input_data=raw,
+        if crop:
+            options = ["-crop", "{2}x{3}+{0}+{1}".format(*crop), "+repage"]
+        else:
+            options = ["-resize", f"{dimension}x{dimension}>"] if dimension else []
+        return run_cli_bytes(converter, "xwd:-", *options, "png:-", input_data=raw,
                              timeout=max(0.0, deadline - time.monotonic()))
     except Unsupported as exc:
         if isinstance(exc.__cause__, subprocess.TimeoutExpired):
@@ -162,15 +169,16 @@ def capture_png(source, dimension=None):
         raise
 
 
-def screenshot_png(window_id, dimension=None):
-    return capture_png(["-id", hex(window_id)], dimension)
+def screenshot_png(window_id, dimension=None, crop=None):
+    return capture_png(["-id", hex(window_id)], dimension, crop)
 
 
 def schemas():
     targeting = {"target_app": {"type": "string"}, "target_pid": {"type": "integer"},
                  "target_window_id": {"type": "integer"}, "expected_state_token": {"type": "string"}}
     props = {
-        "screenshot": targeting, "zoom": {**targeting, "region": {"type": "array"}},
+        "screenshot": {**targeting, "max_image_dimension": {"type": "integer", "minimum": 0, "description": "Long-edge limit in pixels for the returned image; default 1366 unless configured, 0 for the native frame."}},
+        "zoom": {**targeting, "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4, "description": "Integer [x,y,width,height] pixels in the full window image (window_size), top-left origin."}},
         "cursor_position": targeting, "list_windows": {"bundle_id": {"type": "string"}},
         "get_ui_tree": targeting, "jev_decide": {"goal": {"type": "string"}, "allowed_risks": {"type": "array", "items": {"type": "string", "enum": list(RISK_PHRASES)}}, "min_confidence": {"type": "number", "minimum": 0, "maximum": 1}, "min_margin": {"type": "number", "minimum": 0, "maximum": 1}},
         "native_visual_propose": {**targeting, "action": {"type": "string", "enum": ["left_click", "type", "key", "scroll"]}, "coordinate": {"type": "array", "items": {"type": "integer"}}, "text": {"type": "string"}, "key": {"type": "string"}, "delta_y": {"type": "integer"}, "decision": {"type": "string"}},
@@ -250,8 +258,9 @@ def descriptions(name):
     if name == "jev_decide": return "Chrome-tab-only advice: use configured Jev on the currently owned Chrome tab, sending only unique filtered control roles and labels. Requires browser_open; returns a proposal only and never executes it. Controls naming delete/send/purchase/close effects are withheld unless listed in allowed_risks (only for categories the goal authorizes); min_confidence and min_margin (0..1) return NEEDS_AGENT when the decision is weaker. Native screenshot decisions use the MCP caller's visual model instead."
     if name == "native_visual_propose": return "Record a one-use native X11 action proposal made by the MCP caller's visual reasoning model from a prior screenshot. Jev is not sent the screenshot. Requires the exact screenshot target and state token; does not execute input and does not prove proposal origin or user authorization."
     if name == "native_visual_execute": return "Execute a previously recorded one-use visual proposal. Revalidates its exact X11 target and screenshot state immediately before input; expired, stale, replayed, or failed actions return an error, not success."
-    if name == "screenshot": return "Capture the explicitly targeted X11 window and return a PNG image to the MCP caller with target PID, window ID, geometry, and state token. This is input for the caller's visual reasoning model; screenshots are not sent to Jev. The server returns observation metadata and an action contract, not a model-generated proposal."
-    if name in ("left_click", "type", "key", "scroll"): return "Execute one X11 input action only for an explicit PID/window ID and a fresh screenshot state token. Revalidates target and screenshot before dispatch; stale state, invalid coordinates, or utility failure rejects the action. Reobserve after each action."
+    if name == "zoom": return "Return a full-resolution crop of the targeted X11 window: region is [x,y,width,height] in window pixels (window_size). Its state token lets left_click and scroll take pixels of the crop."
+    if name == "screenshot": return "Capture the explicitly targeted X11 window and return a PNG image to the MCP caller with target PID, window ID, geometry, image_size, window_size and state token. The image is scaled to max_image_dimension (default 1366, 0 for the native frame); x,y for click tools are pixels of this image. This is input for the caller's visual reasoning model; screenshots are not sent to Jev. The server returns observation metadata and an action contract, not a model-generated proposal."
+    if name in ("left_click", "type", "key", "scroll"): return "Execute one X11 input action only for an explicit PID/window ID and a screenshot state token; coordinate is pixels of that screenshot or zoom. The token holds while the window keeps its frame; stale state, invalid coordinates, or utility failure rejects the action. Reobserve after each action."
     return "Not implemented safely on Linux/X11; reports unsupported rather than activating, guessing, or posting input."
 
 
@@ -284,7 +293,7 @@ def native_visual_propose(args):
     if action == "left_click" or action == "scroll":
         coordinate = args.get("coordinate")
         if not isinstance(coordinate, list) or len(coordinate) != 2 or any(type(v) is not int for v in coordinate):
-            raise ValueError("coordinate must be [x, y] integer window-relative coordinates.")
+            raise ValueError("coordinate must be [x, y] integer pixels of the screenshot or zoom image.")
         action_args["coordinate"] = coordinate
     if action == "scroll":
         delta = args.get("delta_y")
@@ -311,11 +320,8 @@ def native_visual_propose(args):
             or observation["target_window_id"] != action_args.get("target_window_id")):
         raise Unsupported("Proposal must reference a recent screenshot issued by this server session for the same target.")
     window, _ = verified_target(action_args, require_token=True, verify_screenshot=True)
-    width, height = window["geometry"][2:]
     if action in ("left_click", "scroll"):
-        x, y = action_args["coordinate"]
-        if not (0 <= x < width and 0 <= y < height):
-            raise ValueError("coordinate is outside the target window.")
+        cua_native.to_window(window, *action_args["coordinate"], token_view(token, window))
     _prune_native_visual_proposals()
     if len(NATIVE_VISUAL_PROPOSALS) >= 32:
         raise Unsupported("Too many pending visual proposals; execute or wait for expiry before proposing again.")
@@ -348,7 +354,7 @@ def _call_tool(name, args):
         if os.environ.get("DISPLAY") and os.environ.get("XDG_SESSION_TYPE", "").lower() != "wayland" and shutil.which("wmctrl"):
             supported.append("list_windows")
         if x11_available() and shutil.which("xwd") and (shutil.which("convert") or shutil.which("magick")):
-            supported += ["restore_window", "screenshot", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
+            supported += ["restore_window", "screenshot", "zoom", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
         supported += cua_native.available_tools(sys.modules[__name__])
         browser_available = browser_bridge_available()
         browser_status = None
@@ -407,10 +413,23 @@ def _call_tool(name, args):
         restored, token = verified_target({"target_pid": window["pid"], "target_window_id": window["window_id"]}, verify_screenshot=True)
         return text_result({"restored": True, "window_id": restored["window_id"], "state_token": token,
                             "instruction": "Use this fresh state token for the next action."})
-    if name == "screenshot":
+    if name in ("screenshot", "zoom"):
         target_args = {key: value for key, value in args.items() if key != "expected_state_token"}
         window, _ = verified_target(target_args)
-        image = screenshot_png(window["window_id"])
+        width, height = window["geometry"][2:]
+        region = None
+        if name == "zoom":
+            region = args.get("region")
+            if (not isinstance(region, list) or len(region) != 4 or any(type(v) is not int for v in region)
+                    or min(region[:2]) < 0 or min(region[2:]) <= 0
+                    or region[0] + region[2] > width or region[1] + region[3] > height):
+                raise ValueError("region must be integer [x, y, width, height] pixels inside the window (window_size).")
+            image = screenshot_png(window["window_id"], 0, crop=region)
+        else:
+            dimension = args.get("max_image_dimension")
+            if dimension is not None and (type(dimension) is not int or dimension < 0):
+                raise ValueError("max_image_dimension must be a non-negative integer; 0 keeps the native frame.")
+            image = screenshot_png(window["window_id"], dimension)
         try:
             current, _ = verified_target(target_args)
         except Unsupported as exc:
@@ -418,26 +437,33 @@ def _call_tool(name, args):
         identity = ("window_id", "pid", "desktop", "geometry", "title")
         if any(window[key] != current[key] for key in identity):
             raise Unsupported("Target window changed during screenshot capture; no observation was returned.")
-        token = state_token(window, image)
+        token = state_token(window, image, region)
         supplied = args.get("expected_state_token")
         if supplied is not None and token_view(supplied, window) is None:
             raise Unsupported("Target screenshot state token is stale; refresh the screenshot before proposing an action. " + cua_native.STALE_HINT)
+        if name == "screenshot":
+            cua_native.record_screenshot(window["window_id"], token_view(token, window))
         _prune_native_visual_observations()
         if token not in NATIVE_VISUAL_OBSERVATIONS and len(NATIVE_VISUAL_OBSERVATIONS) >= 32:
             oldest = min(NATIVE_VISUAL_OBSERVATIONS, key=lambda key: NATIVE_VISUAL_OBSERVATIONS[key]["observed_at"])
             NATIVE_VISUAL_OBSERVATIONS.pop(oldest, None)
         NATIVE_VISUAL_OBSERVATIONS[token] = {"observed_at": time.monotonic(), "target_pid": window["pid"],
                                              "target_window_id": window["window_id"], "session": BROWSER_SESSION}
+        # Say what the pixels mean: without the size the caller cannot tell a resized image from the window.
         metadata = {"target_pid": window["pid"], "target_window_id": window["window_id"],
                     "geometry": window["geometry"], "state_token": token,
+                    "image_size": png_size(image), "window_size": [width, height],
+                    "coordinates": "x,y for click tools are pixels of this image (image_size), top-left origin",
                     "visual_proposal_contract": {
                         "required": ["target_pid", "target_window_id", "expected_state_token", "action", "decision"],
-                        "coordinate_actions": {"left_click": "coordinate [x,y] window-relative integers",
+                        "coordinate_actions": {"left_click": "coordinate [x,y] integer pixels of this image",
                                                "scroll": "coordinate [x,y] plus delta_y"},
                         "action_parameters": {"type": "text", "key": "key"},
                         "next_step": "MCP caller visual model may submit native_visual_propose; a separate native_visual_execute call is required",
                         "decision_model": "MCP caller visual reasoning; image is not sent to Jev",
                         "provenance": "state token binds target and pixels but does not prove that a model examined the image"}}
+        if region:
+            metadata["region"] = region
         return {"content": [
             {"type": "image", "data": base64.b64encode(image).decode("ascii"), "mimeType": "image/png"},
             {"type": "text", "text": json.dumps(metadata, sort_keys=True)},
@@ -450,10 +476,8 @@ def _call_tool(name, args):
         if name in ("left_click", "scroll"):
             coordinate = args.get("coordinate")
             if not isinstance(coordinate, list) or len(coordinate) != 2 or any(type(v) is not int for v in coordinate):
-                raise ValueError("coordinate must be [x, y] integer window-relative coordinates.")
-            x, y = coordinate
-            width, height = window["geometry"][2:]
-            if not (0 <= x < width and 0 <= y < height): raise ValueError("coordinate is outside the target window.")
+                raise ValueError("coordinate must be [x, y] integer pixels of the screenshot or zoom image.")
+            x, y = cua_native.to_window(window, *coordinate, token_view(args["expected_state_token"], window))
             commands.append(["xdotool", "mousemove", "--sync", "--window", wid, str(x), str(y)])
         if name == "left_click":
             commands.append(["xdotool", "click", "--window", wid, "1"])

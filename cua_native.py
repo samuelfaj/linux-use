@@ -29,6 +29,8 @@ DISPATCH_DEPTH = 0
 AGENT_INPUT = {"at": float("-inf")}
 # xdotool can exit before the X server has processed its last event.
 AGENT_INPUT_GRACE = 0.25
+# The last screenshot given for each window: click pixels are read from that image, not the window.
+SCREENSHOTS = {}
 # What to do next, for the refusals a caller can act on; a bare refusal sent agents into repeating the call.
 HUMAN_ACTIVITY_HINT = ("Hint: the user is using this target. Prefer a route that does not disturb them (background delivery, "
                        "an AT-SPI action, or a short wait and one retry). If none works, retry with allow_while_user_active: true, "
@@ -70,7 +72,7 @@ PROPERTIES = {
     "clipboard_read": {"include_text": BOOL},
     "clipboard_write": {"text": STRING, "image_path": STRING, "file_path": STRING},
     "check_permissions": {}, "health_report": {}, "get_config": {},
-    "set_config": {"allow_without_activity_check": BOOL, "max_image_dimension": {"type": "integer", "minimum": 1, "maximum": 16384}},
+    "set_config": {"allow_without_activity_check": BOOL, "max_image_dimension": {"type": "integer", "minimum": 0, "maximum": 16384}},
     "start_session": {"session": STRING, "capture_scope": {"type": "string", "enum": ["desktop", "window"]}},
     "end_session": {}, "get_session_state": {},
     "set_agent_cursor_enabled": {"enabled": BOOL}, "set_agent_cursor_theme": {"theme_id": STRING, "theme": STRING, "reduced_motion": {"type": "string", "enum": ["auto", "on", "off"]}},
@@ -118,6 +120,7 @@ DESCRIPTIONS = {
     "invoke_menu": "Invoke an exact enabled AT-SPI menu path; requires python gi Atspi.",
     "set_value": "Set an unambiguous editable AT-SPI value by role/label; requires python gi Atspi.",
     "start_recording": "Record mutations as turn folders with action, before/after PNG and evidence; optionally capture ffmpeg X11 video.",
+    "set_config": "Persist allow_without_activity_check and max_image_dimension (long-edge limit of screenshots, default 1366; 0 keeps the native frame) in ~/.linux-use/config.json.",
     "replay_trajectory": "Replay recorded mutations in order with current human-activity and argument checks; does not bypass stale tokens.",
 }
 
@@ -283,7 +286,7 @@ def get_config(s):
     try:
         config = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
         validate(config, {**schema("set_config"), "properties": PROPERTIES["set_config"]}, "config")
-        return {"max_image_dimension": 1920, "allow_without_activity_check": False, **config}
+        return {"max_image_dimension": 1366, "allow_without_activity_check": False, **config}
     except (OSError, ValueError) as exc:
         raise s.Unsupported(f"Cannot read config safely: {exc}") from exc
 
@@ -353,11 +356,34 @@ def application_command(args, entries):
     return result
 
 
-def position(args, window, xkey="x", ykey="y"):
-    x, y = args[xkey], args[ykey]
-    if not (0 <= x < window["geometry"][2] and 0 <= y < window["geometry"][3]):
-        raise ValueError("Coordinates are outside the target window.")
-    return str(x), str(y)
+def record_screenshot(window_id, view):
+    SCREENSHOTS.pop(window_id, None)
+    SCREENSHOTS[window_id] = view
+    while len(SCREENSHOTS) > 16:
+        SCREENSHOTS.pop(next(iter(SCREENSHOTS)))
+
+
+def to_window(window, x, y, view=None):
+    """Window pixels for x,y read from the image a caller was shown. `view` is the screenshot or zoom
+    (image_size, region, frame) they came from; without one, or once the window has another size,
+    x,y are window pixels. A pixel outside that image is refused, not clamped."""
+    width, height = window["geometry"][2:]
+    image, shown = [width, height], [0, 0, width, height]
+    if view and view.get("image_size") and list(view.get("geometry", [])[2:]) == [width, height]:
+        image, shown = view["image_size"], view.get("region") or shown
+    if not (0 <= x < image[0] and 0 <= y < image[1]):
+        raise ValueError(f"Coordinates are outside the target window's {image[0]}x{image[1]} image pixels.")
+    return shown[0] + int((x + 0.5) * shown[2] / image[0]), shown[1] + int((y + 0.5) * shown[3] / image[1])
+
+
+def pointer_view(s, args, window):
+    """The image a tool's x,y were read from: the screenshot or zoom its token names, else the last screenshot."""
+    view = s.token_view(args["expected_state_token"], window) if "expected_state_token" in args else None
+    return view if view and view.get("image_size") else SCREENSHOTS.get(window["window_id"])
+
+
+def position(args, window, xkey="x", ykey="y", view=None):
+    return tuple(map(str, to_window(window, args[xkey], args[ykey], view)))
 
 
 def keys(values):
@@ -377,18 +403,19 @@ def input_action(s, name, args):
     window = target(s, args)
     wid = hex(window["window_id"])
     foreground = args.get("delivery_mode", "background") == "foreground"
+    view = pointer_view(s, args, window)
     commands = []
     modifiers = []
     if name in ("click", "double_click", "right_click"):
-        x, y = position(args, window)
+        x, y = position(args, window, view=view)
         modifiers = keys(args["modifier"]) if args.get("modifier") else []
         button = {"left": "1", "middle": "2", "right": "3"}["right" if name == "right_click" else args.get("button", "left")]
         count = 2 if name == "double_click" else args.get("count", 1)
         commands.append(["xdotool", "mousemove", "--sync", "--window", wid, x, y])
         commands.append(["xdotool", "click", *([] if foreground else ["--window", wid]), "--repeat", str(count), "--delay", "100", button])
     elif name == "drag":
-        start = position(args, window, "from_x", "from_y")
-        end = position(args, window, "to_x", "to_y")
+        start = position(args, window, "from_x", "from_y", view)
+        end = position(args, window, "to_x", "to_y", view)
         destination = [] if foreground else ["--window", wid]
         commands = [["xdotool", "mousemove", "--sync", "--window", wid, *start],
                     ["xdotool", "mousedown", *destination, "1"],
@@ -868,7 +895,7 @@ def dispatch(s, name, args):
         x, y = args["x"], args["y"]
         if scope == "window":
             window = target(s, args)
-            position(args, window)
+            x, y = to_window(window, x, y, pointer_view(s, args, window))
             x += window["geometry"][0]; y += window["geometry"][1]
         else:
             require_x11(s)
