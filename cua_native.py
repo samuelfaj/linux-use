@@ -31,6 +31,7 @@ BOOL = {"type": "boolean"}
 STRINGS = {"type": "array", "items": STRING}
 TARGET = {"pid": INTEGER, "window_id": INTEGER, "target_pid": INTEGER,
           "target_window_id": INTEGER, "expected_state_token": STRING}
+SELECTOR = {"type": "object", "properties": {"element_id": STRING, "role": STRING, "label": STRING}, "additionalProperties": False}
 DELIVERY = {"delivery_mode": {"type": "string", "enum": ["background", "foreground"]}}
 INPUT = {**TARGET, **DELIVERY}
 COORDS = {"x": INTEGER, "y": INTEGER}
@@ -53,6 +54,8 @@ PROPERTIES = {
                          "h": {"type": "integer", "minimum": 1}},
     "verify_state": {**TARGET, "browser": BOOL, "expect": {"type": "object", "properties": {
         "title_contains": STRING, "window_exists": BOOL, "active": BOOL,
+        "element_exists": SELECTOR, "focused_element": SELECTOR,
+        "element_value": {"type": "object", "properties": {**SELECTOR["properties"], "equals": STRING}, "required": ["equals"], "additionalProperties": False},
         "criteria": {"type": "array", "minItems": 1, "maxItems": 8, "items": {"type": "string", "minLength": 1, "maxLength": 200}}}, "additionalProperties": False}},
     "clipboard_read": {"include_text": BOOL},
     "clipboard_write": {"text": STRING, "image_path": STRING, "file_path": STRING},
@@ -500,6 +503,31 @@ def jev_window_labels(s, window):
         return []
 
 
+def element_check(s, window, key, spec):
+    """mac-use's element checks over a fresh AT-SPI read: True, False, or None when the read cannot tell."""
+    if not spec.get("element_id") and not (spec.get("role") and spec.get("label")):
+        raise ValueError(f"expect.{key} needs element_id, or role and label.")
+    try:
+        _token, nodes = s.atspi_tree.snapshot(s, window)
+    except (s.Unsupported, ValueError):
+        return None
+    complete = len(nodes) < s.atspi_tree.MAX_NODES
+
+    def matches(item):
+        if spec.get("element_id"):
+            return item["id"] == spec["element_id"]
+        return item["role"] == spec["role"] and spec["label"] in (item["name"], item["description"])
+    found = [item for item in nodes if matches(item)]
+    if key == "element_exists":
+        return True if found else (False if complete else None)
+    if key == "focused_element":
+        focused = [item for item in nodes if "focused" in item["states"]]
+        return matches(focused[0]) if len(focused) == 1 else None
+    if len(found) == 1 and found[0]["value"] is not None:
+        return found[0]["value"] == spec["equals"]
+    return False if not found and complete else None
+
+
 def write_value(s, atspi, node, value):
     """Write text or a number through AT-SPI and confirm it by readback; an unconfirmed write is never retried."""
     if isinstance(value, str):
@@ -900,6 +928,8 @@ def dispatch(s, name, args):
                 checks[key] = value in matches[0]["title"]
             elif key == "active":
                 checks[key] = (active_window(s) == matches[0]["window_id"]) == value
+            elif key in ("element_exists", "element_value", "focused_element"):
+                checks[key] = element_check(s, matches[0], key, value)
         verification = None
         if "criteria" in args["expect"]:
             verification = s.verify_criteria(args["expect"]["criteria"], windows=matches)

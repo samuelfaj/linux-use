@@ -1538,3 +1538,28 @@ class SubtaskTests(unittest.TestCase):
                 server.call_tool("run_subtask", {"target_pid": 77, "target_window_id": 4194311, **task})
             self.assertIn(field, str(raised.exception))
             self.assertNotIn("9921", str(raised.exception))
+
+
+class ElementCheckTests(unittest.TestCase):
+    window = {"window_id": 4194311, "pid": 77, "desktop": "0", "geometry": [0, 0, 640, 360], "title": "Form"}
+
+    def check(self, expect, nodes):
+        with patch.dict(os.environ, {"DISPLAY": ":99", "XDG_SESSION_TYPE": "x11"}), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server.atspi_tree, "snapshot", return_value=("ax-t", nodes)):
+            return json.loads(server.call_tool("verify_state", {"window_id": 4194311, "expect": expect})["content"][0]["text"])
+
+    def test_element_checks_answer_from_a_fresh_accessibility_read(self):
+        item = AtspiTreeTests.item
+        nodes = [item(0, "frame", "Form"), item(1, "text", "Name", parent="ax_0", value="Ana", states=["focused"]),
+                 item(2, "button", "Save", parent="ax_0", actions=["click"])]
+        result = self.check({"element_exists": {"role": "button", "label": "Save"},
+                             "element_value": {"role": "text", "label": "Name", "equals": "Ana"},
+                             "focused_element": {"element_id": "ax_1"}}, nodes)
+        self.assertEqual(result["status"], "pass")
+        result = self.check({"element_exists": {"role": "button", "label": "Send"}}, nodes)
+        self.assertEqual(result["status"], "fail")
+        # A read cut at the node limit cannot prove absence, so a missing element is unknown, not fail.
+        big = nodes + [item(index, "label", f"row {index}", parent="ax_0") for index in range(3, server.atspi_tree.MAX_NODES)]
+        result = self.check({"element_exists": {"role": "button", "label": "Send"}}, big)
+        self.assertEqual(result["status"], "unknown")
