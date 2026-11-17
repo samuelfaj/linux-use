@@ -209,6 +209,7 @@ def descriptions(name):
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
     if name == "browser_open": return "Open an HTTP(S) URL in a new background tab of the connected Chrome profile, in a collapsed \"linux-use\" tab group, kept rendering while it stays in the background (Chrome shows its debugging bar until browser_close). Always call browser_close on this same connection when finished or on error, before another open."
     if name == "browser_snapshot": return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text. Pass query to get only the controls you need."
+    if name == "browser_status": return "Report whether the Chrome extension is installed, connected and current: state is connected, busy, outdated, not_connected or not_installed, with a hint for the last four. Never fails; answers within a few seconds."
     if name == "browser_close": return "Release this session and best-effort close its inactive, non-user-owned tab. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Preserve tabs taken over by the user."
     if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards. Yields with human_activity if the user selects the tab; a page that does not answer within 30 seconds returns tab_unresponsive and its tab is released."
     if name.startswith("browser_"): return "Use the separately registered Chrome extension for owned background tabs; page content may contain private information."
@@ -315,22 +316,16 @@ def _call_tool(name, args):
         if x11_available() and shutil.which("xwd") and (shutil.which("convert") or shutil.which("magick")):
             supported += ["restore_window", "screenshot", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
         supported += cua_native.available_tools(sys.modules[__name__])
-        browser_available = browser_bridge_available()
-        browser_status = None
-        if browser_available:
-            try:
-                browser_status = browser_request("browser_status", {})
-            except Unsupported:
-                browser_available = False
-        status_valid = isinstance(browser_status, dict) and browser_status.get("connected") is True
-        if not status_valid:
-            browser_available = False
-        owns_browser_tab = status_valid and browser_status.get("hasTab") is True
+        # A bridge that is not listening cannot answer; say why without waiting for a reconnect.
+        browser_status = extension_status() if browser_bridge_available() else extension_missing("Chrome extension is not connected.")
+        browser_available = browser_status.get("connected") is True
+        owns_browser_tab = browser_available and browser_status.get("hasTab") is True
         jev_available = bool(owns_browser_tab and jev_route())
         return text_result({"platform": sys.platform, "display": bool(os.environ.get("DISPLAY")), "session_type": os.environ.get("XDG_SESSION_TYPE"),
                             "x11_only": True, "human_activity_check": cua_native.health(sys.modules[__name__])["human_activity_check"], "wmctrl": shutil.which("wmctrl"), "xdotool": shutil.which("xdotool"),
                             "supported_native_tools": supported,
                             "supported_browser_tools": [x for x in BASE_TOOLS if x.startswith("browser_") or x == "page"] if browser_available else [],
+                            "chrome_extension": browser_status,
                             "decision_tool_prerequisites_met": jev_available,
                             "jev_prerequisites": {"credential_configured": jev_route() is not None,
                                                   "owned_chrome_tab": owns_browser_tab,
@@ -344,6 +339,8 @@ def _call_tool(name, args):
         return text_result(list_windows())
     if name == "browser_download":
         return text_result(browser_download(args))
+    if name == "browser_status":
+        return text_result(extension_status())
     if name.startswith("browser_") or name == "page":
         return text_result(browser_request(name, args), error=False)
     if name == "jev_decide":
@@ -477,19 +474,35 @@ def install_host(extension_id, home=None):
     if not re.fullmatch(r"[a-p]{32}", extension_id):
         raise ValueError("Expected a 32-character Chrome extension ID containing letters a-p.")
     home = Path(home or Path.home())
-    manifest_dir = home / ".config/google-chrome/NativeMessagingHosts"
+    path = host_registration(home)
     host_dir = home / ".local/lib/linux-use"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     host_dir.mkdir(parents=True, exist_ok=True)
     host = host_dir / "chrome-native-host"
     script = "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -u " + shlex.quote(str(Path(__file__).resolve())) + " chrome-native-host \"$@\"\n"
     host.write_text(script, encoding="utf8")
     host.chmod(0o700)
     manifest = {"name": HOST, "description": "linux-use Chrome native messaging host", "path": str(host), "type": "stdio", "allowed_origins": [f"chrome-extension://{extension_id}/"]}
-    path = manifest_dir / f"{HOST}.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf8")
     path.chmod(0o600)
     return str(path)
+
+
+def host_registration(home=None):
+    """Where install_host registers the native host; Google Chrome reads it from here."""
+    return Path(home or Path.home()) / ".config/google-chrome/NativeMessagingHosts" / f"{HOST}.json"
+
+
+def installed_extension_id(home=None):
+    """The extension ID install_host registered, or None when no valid registration exists."""
+    try:
+        origins = json.loads(host_registration(home).read_text(encoding="utf8"))["allowed_origins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(origins, list) or len(origins) != 1 or not isinstance(origins[0], str):
+        return None
+    match = re.fullmatch(r"chrome-extension://([a-p]{32})/", origins[0])
+    return match[1] if match else None
 
 
 def _read_frame(stream):
@@ -519,23 +532,65 @@ def browser_bridge_available():
         return False
 
 
-def browser_request(operation, arguments):
+class BridgeTimeout(Unsupported):
+    """The extension is connected but did not answer in time; it may be running another request."""
+
+
+def browser_request(operation, arguments, timeout=20):
     request = {"id": str(uuid.uuid4()), "operation": operation, "session": BROWSER_SESSION, "arguments": arguments}
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(20)
+            client.settimeout(timeout)
             client.connect(str(BRIDGE_PATH))
             _write_frame(client.makefile("wb"), request)
             response = _read_frame(client.makefile("rb"))
+    except socket.timeout as exc:
+        raise BridgeTimeout("Chrome bridge timed out. Check the tab before retrying an action.") from exc
     except (OSError, ValueError, EOFError) as exc:
-        if operation == "browser_status":
-            return {"connected": False, "mode": "current_chrome_profile", "reason": "Chrome extension is not connected."}
         raise Unsupported("Chrome extension is not connected; no browser request was performed.") from exc
     if response.get("id") != request["id"]:
         raise Unsupported("Chrome response did not match this request.")
     if response.get("ok") is not True:
         raise Unsupported(str(response.get("error", "Chrome request failed.")))
     return {key: value for key, value in response.items() if key not in ("id", "ok")}
+
+
+# The extension version that keeps its tab awake and answers every request before the host's limit.
+MINIMUM_EXTENSION_VERSION = "1.5.0"
+
+
+def _version(value):
+    try:
+        return tuple(int(part) for part in value.split("."))
+    except (AttributeError, ValueError):
+        return ()
+
+
+def extension_status(timeout=2):
+    """What can be known about the extension without waiting on a page: installed, connected,
+    answering and recent enough. Never raises: a status question deserves a status answer."""
+    try:
+        status = browser_request("browser_status", {}, timeout=timeout)
+    except BridgeTimeout:
+        return {"connected": True, "state": "busy", "hint": "The extension is connected and running another request. Retry shortly."}
+    except Exception as exc:
+        return extension_missing(str(exc))
+    if _version(status.get("version")) >= _version(MINIMUM_EXTENSION_VERSION):
+        status["state"] = "connected"
+    else:
+        status["state"] = "outdated"
+        status["hint"] = (f"Chrome is running an older copy of the extension than this server needs ({MINIMUM_EXTENSION_VERSION}); "
+                          "background tabs can freeze. Reload it in chrome://extensions.")
+    return status
+
+
+def extension_missing(reason):
+    """Why no extension answered. Chrome starts the native host only from install_host's
+    registration, so an extension that answers needs no registration check."""
+    if installed_extension_id() is None:
+        return {"connected": False, "state": "not_installed",
+                "hint": "Load the extension folder in chrome://extensions (Developer mode, Load unpacked), then run: python3 server.py install-chrome-host EXTENSION_ID."}
+    return {"connected": False, "state": "not_connected", "hint": reason}
 
 
 def browser_download(args):

@@ -64,10 +64,12 @@ class MCPTests(unittest.TestCase):
                 self.assertFalse(server.browser_bridge_available())
 
     def test_browser_tools_route_to_extension_and_status_reports_disconnected(self):
-        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False}) as request:
+        with patch.object(server, "browser_request", return_value={"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": server.MINIMUM_EXTENSION_VERSION}) as request:
             result = json.loads(server.call_tool("browser_status", {})["content"][0]["text"])
         self.assertTrue(result["connected"])
-        request.assert_called_once_with("browser_status", {})
+        self.assertEqual(result["state"], "connected")
+        # A status question must not wait behind a slow page the way an action may.
+        request.assert_called_once_with("browser_status", {}, timeout=2)
         with patch.object(server, "browser_request", return_value={"url": "https://example.com/", "loading": True}) as request:
             result = json.loads(server.call_tool("browser_open", {"url": "https://example.com/"})["content"][0]["text"])
         self.assertTrue(result["loading"])
@@ -1039,6 +1041,67 @@ class BrowserPortTests(unittest.TestCase):
         with patch.object(server, "browser_request", return_value={"elements": []}) as request:
             server.call_tool("browser_snapshot", {"query": "delete app"})
         request.assert_called_once_with("browser_snapshot", {"query": "delete app"})
+
+    def test_extension_status_names_every_state_and_never_raises(self):
+        # browser_status is the agent's first browser call. Each state means a different next step
+        # (use the tools, retry, reload, reconnect, install), so none may be mistaken for another,
+        # and a status question must get a status answer rather than an error.
+        current = {"connected": True, "mode": "current_chrome_profile", "hasTab": False, "version": "1.5.0"}
+        cases = [
+            ({"return_value": current}, "a" * 32, "connected"),
+            # Versions compare by number: 1.10.0 is newer than 1.5.0 although it sorts first as text.
+            ({"return_value": {**current, "version": "1.10.0"}}, "a" * 32, "connected"),
+            ({"return_value": {**current, "version": "1.3.1"}}, "a" * 32, "outdated"),
+            ({"return_value": {key: value for key, value in current.items() if key != "version"}}, "a" * 32, "outdated"),
+            ({"side_effect": server.BridgeTimeout("timed out")}, "a" * 32, "busy"),
+            ({"side_effect": server.Unsupported("not connected")}, "a" * 32, "not_connected"),
+            ({"side_effect": server.Unsupported("not connected")}, None, "not_installed"),
+            ({"side_effect": RuntimeError("unexpected")}, "a" * 32, "not_connected"),
+        ]
+        for request, registered, state in cases:
+            with self.subTest(state=state, request=request), patch.object(server, "browser_request", **request), patch.object(
+                server, "installed_extension_id", return_value=registered
+            ):
+                status = server.extension_status()
+            self.assertEqual(status["state"], state)
+            self.assertEqual(status["connected"], state in ("connected", "outdated", "busy"))
+            self.assertEqual("hint" in status, state != "connected")
+
+    def test_browser_status_answers_with_a_state_when_the_bridge_is_down(self):
+        # With Chrome closed there is no bridge socket; the tool must still answer, not fail, and say why.
+        with tempfile.TemporaryDirectory() as home, patch.object(server, "BRIDGE_PATH", Path(home) / "bridge.sock"):
+            server.install_host("a" * 32, home)
+            with patch.object(server.Path, "home", return_value=Path(home)):
+                result = server.call_tool("browser_status", {})
+        status = json.loads(result["content"][0]["text"])
+        self.assertFalse(result["isError"])
+        self.assertEqual(status["state"], "not_connected")
+        self.assertTrue(status["hint"])
+
+    def test_installed_extension_id_reads_what_install_host_registered(self):
+        # The native host trusts only this origin and browser_status says not_installed without it,
+        # so it must read exactly what install_host writes and reject anything else.
+        with tempfile.TemporaryDirectory() as home:
+            self.assertIsNone(server.installed_extension_id(home))
+            server.install_host("b" * 32, home)
+            self.assertEqual(server.installed_extension_id(home), "b" * 32)
+            origin = "chrome-extension://{}/".format
+            for broken in ("not json", "[]", json.dumps({"allowed_origins": [origin("b" * 32), origin("c" * 32)]}),
+                           json.dumps({"allowed_origins": [origin("z" * 32)]})):
+                server.host_registration(home).write_text(broken)
+                self.assertIsNone(server.installed_extension_id(home))
+
+    def test_doctor_and_health_report_include_the_extension_state(self):
+        # Diagnostics are where a user looks when browser tools are missing; they must say which state.
+        with patch.object(server, "browser_bridge_available", return_value=False), patch.object(
+            server, "installed_extension_id", return_value=None
+        ):
+            doctor = json.loads(server.call_tool("doctor", {})["content"][0]["text"])
+        self.assertEqual(doctor["chrome_extension"]["state"], "not_installed")
+        self.assertEqual(doctor["supported_browser_tools"], [])
+        with patch.object(server, "extension_status", return_value={"connected": True, "state": "busy", "hint": "retry"}):
+            health = json.loads(server.call_tool("health_report", {})["content"][0]["text"])
+        self.assertEqual(health["chrome_extension"]["state"], "busy")
 
     def test_download_moves_completed_file_and_never_overwrites(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(server.Path, "home", return_value=Path(folder)):
