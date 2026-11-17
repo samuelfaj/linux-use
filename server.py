@@ -209,7 +209,7 @@ def descriptions(name):
     if name == "restore_window": return "Explicitly restore and focus the exact X11 window after validating its current state token; returns a fresh token."
     if name == "browser_open": return "Open an HTTP(S) URL in a new background tab of the connected Chrome profile, in a collapsed \"linux-use\" tab group, kept rendering while it stays in the background (Chrome shows its debugging bar until browser_close). Always call browser_close on this same connection when finished or on error, before another open."
     if name == "browser_snapshot": return "Read the owned Chrome background tab and obtain fresh element refs; may contain private page text. Pass query to get only the controls you need."
-    if name == "browser_status": return "Report whether the Chrome extension is installed, connected and current: state is connected, busy, outdated, not_connected or not_installed, with a hint for the last four. Never fails; answers within a few seconds."
+    if name == "browser_status": return "Report whether the Chrome extension is installed, connected and current: state is connected, busy, outdated, not_connected or not_installed, with a hint for the last four. Never fails; answers within 2 seconds."
     if name == "browser_close": return "Release this session and best-effort close its inactive, non-user-owned tab. Check closed separately from released, then verify browser_status; release alone is not proof of removal. Preserve tabs taken over by the user."
     if name == "browser_act": return "Act on an element ref from the latest browser_snapshot in the owned tab (select: fill by option value or text). Refuses covered elements. Waits for the page to settle and returns a fresh snapshot with settle_ms and settled; refs from the previous snapshot are stale afterwards. Yields with human_activity if the user selects the tab; a page that does not answer within 30 seconds returns tab_unresponsive and its tab is released."
     if name.startswith("browser_"): return "Use the separately registered Chrome extension for owned background tabs; page content may contain private information."
@@ -317,7 +317,7 @@ def _call_tool(name, args):
             supported += ["restore_window", "screenshot", "left_click", "type", "key", "scroll", "native_visual_propose", "native_visual_execute"]
         supported += cua_native.available_tools(sys.modules[__name__])
         # A bridge that is not listening cannot answer; say why without waiting for a reconnect.
-        browser_status = extension_status() if browser_bridge_available() else extension_missing("Chrome extension is not connected.")
+        browser_status = extension_status() if browser_bridge_available() else extension_missing(EXTENSION_NOT_CONNECTED)
         browser_available = browser_status.get("connected") is True
         owns_browser_tab = browser_available and browser_status.get("hasTab") is True
         jev_available = bool(owns_browser_tab and jev_route())
@@ -536,18 +536,56 @@ class BridgeTimeout(Unsupported):
     """The extension is connected but did not answer in time; it may be running another request."""
 
 
-def browser_request(operation, arguments, timeout=20):
-    request = {"id": str(uuid.uuid4()), "operation": operation, "session": BROWSER_SESSION, "arguments": arguments}
+CHROME_PROCESSES = {"chrome", "chromium", "chromium-browse"}
+EXTENSION_NOT_CONNECTED = ("The linux-use Chrome extension is not connected. It reconnects every 30 seconds; its toolbar button "
+                           "reconnects at once. If it is not in this Chrome profile, load the extension folder in chrome://extensions.")
+
+
+def process_name(pid):
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(timeout)
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def chrome_running():
+    try:
+        return any(process_name(entry.name) in CHROME_PROCESSES for entry in Path("/proc").iterdir() if entry.name.isdigit())
+    except OSError:
+        return False
+
+
+def browser_request(operation, arguments, timeout=40):
+    """`timeout` outlasts the extension (30 s) and the native host (35 s), so their own answer arrives first."""
+    request = {"id": str(uuid.uuid4()), "operation": operation, "session": BROWSER_SESSION, "arguments": arguments}
+    start = time.monotonic()
+    while True:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
             client.connect(str(BRIDGE_PATH))
-            _write_frame(client.makefile("wb"), request)
-            response = _read_frame(client.makefile("rb"))
-    except socket.timeout as exc:
-        raise BridgeTimeout("Chrome bridge timed out. Check the tab before retrying an action.") from exc
-    except (OSError, ValueError, EOFError) as exc:
-        raise Unsupported("Chrome extension is not connected; no browser request was performed.") from exc
+            break
+        except OSError as exc:
+            client.close()
+            running = chrome_running()
+            # The extension reconnects about a second after a drop; wait that out while Chrome is up.
+            if not running or time.monotonic() - start >= min(3, timeout / 2):
+                raise Unsupported(EXTENSION_NOT_CONNECTED if running
+                                  else "Google Chrome is not running, so the linux-use extension is not connected.") from exc
+            time.sleep(0.1)
+    with client:
+        client.settimeout(timeout - (time.monotonic() - start))
+        try:
+            with client.makefile("wb") as writer:
+                _write_frame(writer, request)
+            with client.makefile("rb") as reader:
+                response = _read_frame(reader)
+        except socket.timeout as exc:
+            raise BridgeTimeout("Chrome bridge timed out. Check the tab before retrying an action.") from exc
+        except (OSError, EOFError) as exc:
+            raise Unsupported("The Chrome extension stopped answering and its bridge restarted. "
+                              "It reconnects by itself; call browser_status, then retry.") from exc
+        except ValueError as exc:
+            raise Unsupported("Invalid Chrome message.") from exc
     if response.get("id") != request["id"]:
         raise Unsupported("Chrome response did not match this request.")
     if response.get("ok") is not True:

@@ -1,7 +1,10 @@
 import json
 import os
 import fcntl
+import socket
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1069,7 +1072,9 @@ class BrowserPortTests(unittest.TestCase):
 
     def test_browser_status_answers_with_a_state_when_the_bridge_is_down(self):
         # With Chrome closed there is no bridge socket; the tool must still answer, not fail, and say why.
-        with tempfile.TemporaryDirectory() as home, patch.object(server, "BRIDGE_PATH", Path(home) / "bridge.sock"):
+        with tempfile.TemporaryDirectory() as home, patch.object(server, "BRIDGE_PATH", Path(home) / "bridge.sock"), patch.object(
+            server, "chrome_running", return_value=False
+        ):
             server.install_host("a" * 32, home)
             with patch.object(server.Path, "home", return_value=Path(home)):
                 result = server.call_tool("browser_status", {})
@@ -1077,6 +1082,60 @@ class BrowserPortTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(status["state"], "not_connected")
         self.assertTrue(status["hint"])
+
+    def test_bridge_waits_out_an_extension_reconnect_but_not_a_closed_chrome(self):
+        # The extension reconnects about a second after a drop, so a call made in that gap should land
+        # instead of failing. With Chrome closed nothing will reconnect, so fail at once and say why.
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with patch.object(server, "chrome_running", return_value=False):
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "Chrome is not running"):
+                    server.browser_request("browser_snapshot", {})
+                self.assertLess(time.monotonic() - start, 0.5)
+
+            def reconnect_then_answer():
+                time.sleep(0.3)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                    listener.bind(str(server.BRIDGE_PATH))
+                    listener.listen(1)
+                    client, _ = listener.accept()
+                    with client:
+                        request = server._read_frame(client.makefile("rb"))
+                        server._write_frame(client.makefile("wb"), {"id": request["id"], "ok": True, "url": "https://example.com/"})
+                server.BRIDGE_PATH.unlink()
+
+            extension = threading.Thread(target=reconnect_then_answer)
+            extension.start()
+            with patch.object(server, "chrome_running", return_value=True):
+                self.assertEqual(server.browser_request("browser_snapshot", {}), {"url": "https://example.com/"})
+                extension.join()
+                # Chrome is up but the extension never comes back: give up after the wait, with the reconnect hint.
+                start = time.monotonic()
+                with self.assertRaisesRegex(server.Unsupported, "extension is not connected. It reconnects"):
+                    server.browser_request("browser_snapshot", {}, timeout=1)
+                self.assertGreaterEqual(time.monotonic() - start, 0.5)
+
+    def test_bridge_failures_say_which_failure_happened(self):
+        # A closed bridge means "check browser_status and retry"; a timeout means the action may have
+        # run, so "check the tab before retrying". The caller can only choose if the messages differ.
+        def bridge():
+            server.BRIDGE_PATH.unlink(missing_ok=True)
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(server.BRIDGE_PATH))
+            listener.listen(1)
+            return listener
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "BRIDGE_PATH", Path(directory) / "bridge.sock"):
+            with bridge():
+                with self.assertRaisesRegex(server.BridgeTimeout, "timed out. Check the tab"):
+                    server.browser_request("browser_snapshot", {}, timeout=0.3)
+            with bridge() as listener:
+                closing = threading.Thread(target=lambda: listener.accept()[0].close())
+                closing.start()
+                with self.assertRaisesRegex(server.Unsupported, "stopped answering") as caught:
+                    server.browser_request("browser_snapshot", {}, timeout=2)
+                closing.join()
+                self.assertNotIsInstance(caught.exception, server.BridgeTimeout)
 
     def test_installed_extension_id_reads_what_install_host_registered(self):
         # The native host trusts only this origin and browser_status says not_installed without it,
