@@ -83,12 +83,12 @@ def verified_target(args, require_token=False, verify_screenshot=False):
         raise ValueError("target_pid and target_window_id are required; no implicit active-window targeting is allowed.")
     matches = [window for window in list_windows() if window["pid"] == pid and window["window_id"] == wid]
     if len(matches) != 1:
-        raise Unsupported("Target window identity is missing or ambiguous; no action was performed.")
+        raise Unsupported("Target window identity is missing or ambiguous; no action was performed. " + cua_native.MISSING_HINT)
     window = matches[0]
     screenshot = screenshot_png(window["window_id"]) if verify_screenshot else None
     token = state_token(window, screenshot)
     if supplied is not None and supplied != token:
-        raise Unsupported("Target state token is stale; refresh the target state before acting.")
+        raise Unsupported("Target state token is stale; refresh the target state before acting. " + cua_native.STALE_HINT)
     return window, token
 
 
@@ -138,6 +138,8 @@ def schemas():
         "browser_open": {"url": {"type": "string"}},
         "browser_act": {"action": {"type": "string", "enum": ["click", "fill", "type", "scroll"]}, "ref": {"type": "string"}, "text": {"type": "string"}, "delta_x": {"type": "number"}, "delta_y": {"type": "number"}},
     }
+    for name in ("restore_window", "left_click", "type", "key", "scroll", "click_element", "native_visual_execute"):
+        props[name] = {**props[name], "allow_while_user_active": cua_native.ALLOW_WHILE_USER_ACTIVE}
     required = {"screenshot": ["target_pid", "target_window_id"], "zoom": ["target_pid", "target_window_id", "region"],
         "restore_window": ["target_pid", "target_window_id", "expected_state_token"],
         "cursor_position": ["target_pid", "target_window_id"], "get_ui_tree": ["target_pid", "target_window_id"],
@@ -343,7 +345,8 @@ def _call_tool(name, args):
         if not isinstance(proposal_id, str) or not proposal_id:
             raise ValueError("proposal_id must be a non-empty string.")
         proposal = take_native_visual_proposal(proposal_id)
-        return call_tool(proposal["action"], proposal["arguments"])
+        escalation = {"allow_while_user_active": True} if args.get("allow_while_user_active") is True else {}
+        return call_tool(proposal["action"], {**proposal["arguments"], **escalation})
     if name == "browser_close":
         return text_result(browser_request(name, args), error=False)
     if name == "restore_window":
@@ -355,7 +358,7 @@ def _call_tool(name, args):
         except ValueError as exc:
             raise Unsupported("Could not verify the focused X11 window; no further action was performed.") from exc
         if focused_id != window["window_id"]:
-            raise Unsupported("Window manager did not focus the requested window; no further action was performed.")
+            raise Unsupported("Window manager did not focus the requested window; no further action was performed. " + cua_native.FOCUS_HINT)
         restored, token = verified_target({"target_pid": window["pid"], "target_window_id": window["window_id"]}, verify_screenshot=True)
         return text_result({"restored": True, "window_id": restored["window_id"], "state_token": token,
                             "instruction": "Use this fresh state token for the next action."})
@@ -373,7 +376,7 @@ def _call_tool(name, args):
         token = state_token(window, image)
         supplied = args.get("expected_state_token")
         if supplied is not None and supplied != token:
-            raise Unsupported("Target screenshot state token is stale; refresh the screenshot before proposing an action.")
+            raise Unsupported("Target screenshot state token is stale; refresh the screenshot before proposing an action. " + cua_native.STALE_HINT)
         _prune_native_visual_observations()
         if token not in NATIVE_VISUAL_OBSERVATIONS and len(NATIVE_VISUAL_OBSERVATIONS) >= 32:
             oldest = min(NATIVE_VISUAL_OBSERVATIONS, key=lambda key: NATIVE_VISUAL_OBSERVATIONS[key]["observed_at"])

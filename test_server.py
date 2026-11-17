@@ -535,6 +535,23 @@ class MCPTests(unittest.TestCase):
                 server.call_tool("type", {"target_pid":4321, "target_window_id":9, "expected_state_token":"old", "text":"x"})
             execute.assert_not_called()
 
+    def test_refusals_say_what_to_do_next(self):
+        # A bare "stale" or "missing" sent agents into repeating the same call.
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=b"pixels"
+        ), patch.object(server, "run_cli") as execute:
+            base = {"target_pid": 4321, "target_window_id": 0x1234, "text": "x"}
+            with self.assertRaisesRegex(server.Unsupported, "stale.*Take a new screenshot"):
+                server.call_tool("type", {**base, "expected_state_token": "old"})
+            with self.assertRaisesRegex(server.Unsupported, "missing or ambiguous.*Call list_windows"):
+                server.call_tool("type", {**base, "target_window_id": 9, "expected_state_token": "old"})
+            execute.assert_not_called()
+            # Foreground delivery the window manager refused names the routes that remain.
+            execute.return_value = "99"
+            with patch.object(server.cua_native.time, "sleep"), self.assertRaisesRegex(
+                    server.Unsupported, "did not become active.*restore_window.*background delivery"):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "delivery_mode": "foreground"})
+
     def test_bad_coordinates_and_key_input_refuse_dispatch(self):
         token = server.state_token(self.window, b"pixels")
         with patch.object(server, "list_windows", return_value=[self.window]), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli") as execute:
@@ -883,6 +900,49 @@ class NativePortTests(unittest.TestCase):
             with self.assertRaisesRegex(server.Unsupported, "human_activity"):
                 self.value("click", {"window_id": 0x1234, "x": 10, "y": 20})
             self.assertFalse([call for call in run.call_args_list if call.args[1:2] in (("mousemove",), ("click",))])
+
+    def test_escalation_acts_while_the_user_is_on_the_target_and_the_refusal_says_how(self):
+        # Stealth is the default, but a refusal must not be a dead end: when no quiet route exists
+        # the caller retries the same call with allow_while_user_active.
+        def cli(*args):
+            if args[0] == "xprintidle":
+                return "100"
+            if args[1] == "getmouselocation":
+                return "X=10\nY=20\nWINDOW=4660\n"
+            if args[1] == "getactivewindow":
+                return "4660"
+            return ""
+        def sent(run, verb):
+            return [c.args for c in run.call_args_list if c.args[:2] == ("xdotool", verb)]
+        def user_moves():
+            # The user's last input (100 ms ago) came after anything the agent sent.
+            self.native.AGENT_INPUT["at"] = float("-inf")
+        token = server.state_token(self.window, b"pixels")
+        legacy = {"target_pid": 4321, "target_window_id": 0x1234, "expected_state_token": token, "text": "hi"}
+        with patch.object(server.shutil, "which", return_value="/usr/bin/tool"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "screenshot_png", return_value=b"pixels"), patch.object(server, "run_cli", side_effect=cli) as run:
+            for name, args, verb in (("click", {"window_id": 0x1234, "x": 1, "y": 2}, "click"), ("type", legacy, "type")):
+                with self.subTest(name=name):
+                    user_moves()
+                    with self.assertRaises(server.Unsupported) as refused:
+                        server.call_tool(name, args)
+                    self.assertIn("allow_while_user_active", str(refused.exception))
+                    self.assertEqual(sent(run, verb), [])
+                    self.assertFalse(server.call_tool(name, {**args, "allow_while_user_active": True})["isError"])
+                    self.assertEqual(len(sent(run, verb)), 1)
+            with self.assertRaises(ValueError):
+                server.call_tool("click", {"window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": "yes"})
+            # Escalating a replay does not escalate what it replays: a recorded escalation was for that moment.
+            with tempfile.TemporaryDirectory() as source:
+                (Path(source) / "turn-00001").mkdir()
+                (Path(source) / "turn-00001/action.json").write_text(json.dumps({"name": "click", "arguments": {
+                    "window_id": 0x1234, "x": 1, "y": 2, "allow_while_user_active": True}}))
+                user_moves()
+                replay = self.value("replay_trajectory", {"dir": source, "allow_while_user_active": True})
+            self.assertFalse(replay["ok"])
+            self.assertIn("human_activity", replay["results"][0]["content"][0]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
 
     def test_health_reports_missing_idle_check(self):
         with patch.object(server.shutil, "which", return_value=None):

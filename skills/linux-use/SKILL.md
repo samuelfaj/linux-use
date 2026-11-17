@@ -14,6 +14,17 @@ Complete the requested task and leave no unrequested resources or changes behind
 - Existing tabs, windows, applications, processes, and user files are borrowed. Do not close them as cleanup. A resource the user takes over becomes user-owned, even if you created it.
 - Treat cleanup as a `finally` step: run it on success, failure, blocked work, and cancellation while tools remain available, before handing off or sending the final response. Carry unresolved resource identities into a handoff. Do not rely on MCP exit or extension disconnect to clean up.
 
+## Stealth first, then escalate
+
+Do the work without disturbing the user whenever a route for it exists, and do not stop when none does.
+
+1. Start with the routes that never take focus: the owned background Chrome tab through the browser tools, AT-SPI actions (`invoke_menu`, `set_value`), and background delivery. On X11, background pointer input still moves the real pointer, and some toolkits (GTK 3) ignore background clicks; read the window again before building on one.
+2. `human_activity` means the user is on the target: keyboard or pointer input in the last two seconds while the target was active or under the pointer. Input this server sent does not count. First look for a route around them, such as a short wait and one retry.
+3. If no quiet route can do the work, escalate instead of stopping. Retry the refused call with `allow_while_user_active: true`, and use `delivery_mode: "foreground"`, `bring_to_front` or `restore_window` when the app ignores background input. Do the minimum, then tell the user what you interrupted. `replay_trajectory` never repeats an escalation; escalate the live call instead.
+4. Never escalate when the user said they do not want to be interrupted, in this conversation or in their standing instructions. Stop and report what is still pending.
+
+Escalation is about focus and timing only. A consequential action still needs the user's authorization. The browser tools have no escalation: the extension's takeover check always wins.
+
 ## Jev-first decisions and verification
 
 1. Start with structured text: native window metadata/Accessibility labels where supported, or `browser_snapshot` for the owned tab. Use filtered labels, roles and goal text; never send screenshots, field values or secrets to Jev.
@@ -26,7 +37,7 @@ Complete the requested task and leave no unrequested resources or changes behind
 - Track every recording you start and its output directory. In the `finally` cleanup, call `stop_recording` for your recording, then `end_session` for each session you started; inspect `get_recording_state` and `get_session_state` to verify cleanup. Do not stop another task's recording. Replay repeats real actions; authorize and verify them as live actions.
 - Use `kill_app` only for an exact application PID you launched and still own, never a pre-existing application or one the user took over. Prefer closing the owned window when an application contains borrowed windows.
 - If you overwrite the clipboard, first capture enough prior content to restore it safely. Track the overwrite, restore the prior clipboard only if it is still your change, and verify restoration. Never overwrite intervening user activity; if safe restoration is unavailable, do not overwrite it for convenience.
-- Keep input in background mode by default. Use `delivery_mode: "foreground"` only when explicitly requested; it temporarily activates the target and restores the prior app. `bring_to_front` is a separate persistent activation and needs explicit intent. On `human_activity`, stop; never switch delivery modes or tools to bypass it. Window-scope `move_cursor` changes only the overlay; desktop scope moves the real pointer and needs explicit intent.
+- Keep input in background mode by default. `delivery_mode: "foreground"` temporarily activates the target and restores the prior app; `bring_to_front` is a separate persistent activation. Use either only as described in "Stealth first, then escalate". Window-scope `move_cursor` changes only the overlay; desktop scope moves the real pointer and needs explicit intent.
 
 ## Chrome: open, use, close, verify
 

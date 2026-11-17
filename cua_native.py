@@ -29,6 +29,14 @@ DISPATCH_DEPTH = 0
 AGENT_INPUT = {"at": float("-inf")}
 # xdotool can exit before the X server has processed its last event.
 AGENT_INPUT_GRACE = 0.25
+# What to do next, for the refusals a caller can act on; a bare refusal sent agents into repeating the call.
+HUMAN_ACTIVITY_HINT = ("Hint: the user is using this target. Prefer a route that does not disturb them (background delivery, "
+                       "an AT-SPI action, or a short wait and one retry). If none works, retry with allow_while_user_active: true, "
+                       "unless the user said not to interrupt them.")
+STALE_HINT = "Hint: the window changed since that token was read. Take a new screenshot and retry with its state_token."
+MISSING_HINT = "Hint: that pid and window id are not on the window list now. Call list_windows."
+FOCUS_HINT = ("Hint: the window manager did not hand focus to the window. Retry once, use restore_window, "
+              "or use background delivery, which needs no focus.")
 
 STRING = {"type": "string"}
 INTEGER = {"type": "integer"}
@@ -85,12 +93,17 @@ REQUIRED = {
 }
 for properties in PROPERTIES.values():
     properties["session"] = STRING
+ALLOW_WHILE_USER_ACTIVE = {"type": "boolean", "description": "Act even though the user is using the target. Only after the "
+                           "non-disturbing routes failed, and never when the user said not to interrupt them."}
 
 READ_ONLY = {"list_apps", "get_accessibility_tree", "get_desktop_state", "get_screen_size",
              "get_cursor_position", "verify_state", "clipboard_read", "check_permissions", "health_report",
              "get_config", "get_session_state", "get_agent_cursor_state", "get_recording_state"}
 CONTROL = {"start_recording", "stop_recording", "replay_trajectory"}
 MUTATIONS = set(PROPERTIES) - READ_ONLY
+# Stealth is the default; every mutation can be escalated once the quiet routes failed.
+for tool in MUTATIONS:
+    PROPERTIES[tool]["allow_while_user_active"] = ALLOW_WHILE_USER_ACTIVE
 LEGACY_MUTATIONS = {"restore_window", "left_click", "type", "key", "scroll", "click_element",
                     "native_visual_execute", "browser_open", "browser_act", "browser_close"}
 DESCRIPTIONS = {
@@ -170,12 +183,12 @@ def target(s, args, optional=False):
         raise ValueError("pid must be a positive integer.")
     windows = [w for w in s.list_windows() if (wid is None or w["window_id"] == wid) and (pid is None or w["pid"] == pid)]
     if len(windows) != 1:
-        raise s.Unsupported("Target window identity is missing or ambiguous; no action was performed.")
+        raise s.Unsupported("Target window identity is missing or ambiguous; no action was performed. " + MISSING_HINT)
     window = windows[0]
     if "expected_state_token" in args:
         token = s.state_token(window, s.screenshot_png(window["window_id"]))
         if args["expected_state_token"] not in (token, s.state_token(window)):
-            raise s.Unsupported("Target state token is stale; refresh before acting.")
+            raise s.Unsupported("Target state token is stale; refresh before acting. " + STALE_HINT)
     return window
 
 
@@ -191,6 +204,8 @@ def human_guard(s, args, all_windows=False):
     if not shutil.which("xprintidle"):
         if not get_config(s)["allow_without_activity_check"]:
             raise s.Unsupported("human_activity_check_unavailable: install xprintidle")
+        return
+    if args.get("allow_while_user_active") is True:
         return
     require_x11(s)
     started = time.monotonic()
@@ -210,7 +225,8 @@ def human_guard(s, args, all_windows=False):
     windows = s.list_windows()
     ids = {w["window_id"] for w in windows if (wid is None or w["window_id"] == wid) and (pid is None or w["pid"] == pid)}
     if all_windows or wid is None and pid is None or active in ids or int(match[1]) in ids:
-        raise s.Unsupported("human_activity: recent pointer/keyboard activity on the target window; no mutation performed.")
+        raise s.Unsupported("human_activity: recent pointer/keyboard activity on the target window; no mutation performed. "
+                            + HUMAN_ACTIVITY_HINT)
 
 
 def inject(s, *command):
@@ -410,7 +426,7 @@ def input_action(s, name, args):
                         break
                     time.sleep(0.1)
                 else:
-                    raise s.Unsupported("foreground activation failed: target window did not become active")
+                    raise s.Unsupported("foreground activation failed: target window did not become active. " + FOCUS_HINT)
         for modifier in modifiers:
             inject(s, "xdotool", "keydown", *([] if foreground else ["--window", wid]), modifier)
             held.append(modifier)
@@ -1002,8 +1018,10 @@ def dispatch(s, name, args):
         for index, action in enumerate(actions):
             if index:
                 time.sleep(args.get("delay_ms", 500) / 1000)
+            # Escalation was a decision about that moment; a replay yields to the user again.
+            arguments = {key: value for key, value in action["arguments"].items() if key != "allow_while_user_active"}
             try:
-                result = s.call_tool(action["name"], action["arguments"])
+                result = s.call_tool(action["name"], arguments)
             except (s.Unsupported, ValueError) as exc:
                 result = s.text_result(str(exc), error=True)
             results.append(result)
