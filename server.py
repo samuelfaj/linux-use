@@ -1261,7 +1261,7 @@ def jev_decide(goal, allowed_risks=None, min_confidence=None, min_margin=None):
                                 "label": item["label"]} for item in targets],
                 "state_token": first["state_token"],
                 "instructions": "Decide from the user's goal and these filtered candidates. Evidence is not authorization. "
-                                "Use browser_act click with the ref and a fresh state_token, then observe again."}
+                                "Use browser_act click with the ref from this snapshot (refs go stale after any action), then observe again."}
     if not targets:
         return {"mode": "jev", "operation": "BLOCKED", "reason": "No unambiguous, privacy-filtered browser controls are available.",
                 "state_token": first["state_token"]}
