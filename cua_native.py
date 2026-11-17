@@ -82,6 +82,11 @@ PROPERTIES = {
     "get_recording_state": {}, "replay_trajectory": {"dir": STRING, "delay_ms": {"type": "integer", "minimum": 0, "maximum": 10000}, "stop_on_error": BOOL},
     "invoke_menu": {**TARGET, "path": STRINGS},
     "set_value": {**TARGET, "role": STRING, "label": STRING, "value": {"type": ["string", "number"]}},
+    "run_steps": {"steps": {"type": "array", "minItems": 1, "maxItems": 32, "items": {
+                      "type": "object", "properties": {"tool": STRING, "arguments": {"type": "object"}},
+                      "required": ["tool"], "additionalProperties": False}},
+                  "observe": {"type": "object", "description": "Arguments for one screenshot after the steps: target_pid, "
+                              "target_window_id and optionally max_image_dimension."}},
 }
 REQUIRED = {
     "kill_app": ["pid"], "move_cursor": ["x", "y"], "click": ["x", "y"],
@@ -91,7 +96,7 @@ REQUIRED = {
     "verify_state": ["expect"], "start_session": ["session"], "set_agent_cursor_enabled": ["enabled"],
     "set_agent_cursor_theme": [], "set_agent_cursor_motion": [],
     "start_recording": ["output_dir"], "replay_trajectory": ["dir"], "invoke_menu": ["path"],
-    "set_value": ["value"],
+    "set_value": ["value"], "run_steps": ["steps"],
 }
 for properties in PROPERTIES.values():
     properties["session"] = STRING
@@ -101,10 +106,10 @@ ALLOW_WHILE_USER_ACTIVE = {"type": "boolean", "description": "Act even though th
 READ_ONLY = {"list_apps", "get_accessibility_tree", "get_desktop_state", "get_screen_size",
              "get_cursor_position", "verify_state", "clipboard_read", "check_permissions", "health_report",
              "get_config", "get_session_state", "get_agent_cursor_state", "get_recording_state"}
-CONTROL = {"start_recording", "stop_recording", "replay_trajectory"}
+CONTROL = {"start_recording", "stop_recording", "replay_trajectory", "run_steps"}
 MUTATIONS = set(PROPERTIES) - READ_ONLY
 # Stealth is the default; every mutation can be escalated once the quiet routes failed.
-for tool in MUTATIONS:
+for tool in MUTATIONS - {"run_steps"}:  # each step carries its own
     PROPERTIES[tool]["allow_while_user_active"] = ALLOW_WHILE_USER_ACTIVE
 LEGACY_MUTATIONS = {"restore_window", "left_click", "type", "key", "scroll", "click_element",
                     "native_visual_execute", "browser_open", "browser_act", "browser_close"}
@@ -121,6 +126,7 @@ DESCRIPTIONS = {
     "set_value": "Set an unambiguous editable AT-SPI value by role/label; requires python gi Atspi.",
     "start_recording": "Record mutations as turn folders with action, before/after PNG and evidence; optionally capture ffmpeg X11 video.",
     "set_config": "Persist allow_without_activity_check and max_image_dimension (long-edge limit of screenshots, default 1366; 0 keeps the native frame) in ~/.linux-use/config.json.",
+    "run_steps": "Run up to 32 tool calls in order in one round trip, stopping at the first that fails, then optionally take one screenshot (observe: the arguments of screenshot). Use it to act and look together: steps:[{tool, arguments}]. Each step is validated, guarded and recorded like its own call; step results are text; a step cannot be run_steps or replay_trajectory.",
     "replay_trajectory": "Replay recorded mutations in order with current human-activity and argument checks; does not bypass stale tokens.",
 }
 
@@ -1078,6 +1084,37 @@ def dispatch(s, name, args):
             if result.get("isError") and args.get("stop_on_error", True):
                 return {"ok": False, "results": results, "stopped_on_error": True}
         return {"ok": not any(result.get("isError") for result in results), "results": results}
+    if name == "run_steps":
+        # Acting and looking used to be separate round trips with the window free to change between them.
+        steps, results, failed = args["steps"], [], None
+        for index, step in enumerate(steps):
+            if step["tool"] not in s.BASE_TOOLS or step["tool"] in ("run_steps", "replay_trajectory"):
+                results.append({"tool": step["tool"], "ok": False, "text": "not a tool that can run as a step"})
+                failed = index
+                break
+            try:
+                result = s.call_tool(step["tool"], step.get("arguments", {}))
+            except (s.Unsupported, ValueError) as exc:
+                result = s.text_result(str(exc), error=True)
+            text = "\n".join(item["text"] for item in result["content"] if item.get("type") == "text")
+            results.append({"tool": step["tool"], "ok": not result.get("isError"), "text": text[:1200]})
+            if result.get("isError"):
+                failed = index
+                break
+        output = {"completed": len(steps) if failed is None else failed, "total": len(steps), "results": results}
+        if failed is not None:
+            output["failed_step"] = failed
+        observation = []
+        if "observe" in args:
+            try:
+                observed = s.call_tool("screenshot", args["observe"])
+            except (s.Unsupported, ValueError) as exc:
+                observed = s.text_result(str(exc), error=True)
+            if observed.get("isError"):
+                output["observation_error"] = observed["content"][0]["text"]
+            else:
+                observation = observed["content"]
+        return {"content": [{"type": "text", "text": json.dumps(output, sort_keys=True)}, *observation], "isError": failed is not None}
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -1132,11 +1169,11 @@ def call(s, original, name, args):
             evidence["error"] = str(exc)
             (turn / "evidence.json").write_text(json.dumps(evidence, sort_keys=True))
             raise
-    depth_increment = int(name != "replay_trajectory")
+    depth_increment = int(name not in ("replay_trajectory", "run_steps"))  # their steps are recorded
     DISPATCH_DEPTH += depth_increment
     try:
         # Browser activity checks remain owned by the Chrome extension.
-        if mutation and not name.startswith("browser_") and name not in {"native_visual_execute", "launch_app"}:
+        if mutation and not name.startswith("browser_") and name not in {"native_visual_execute", "launch_app", "run_steps"}:
             human_guard(s, args, all_windows=name == "clipboard_write")
         value = dispatch(s, name, args) if name in PROPERTIES else original(name, args)
         result = value if isinstance(value, dict) and "content" in value else s.text_result(value, error=isinstance(value, dict) and value.get("ok") is False)

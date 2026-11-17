@@ -771,7 +771,7 @@ class NativePortTests(unittest.TestCase):
         return json.loads(server.call_tool(name, args or {})["content"][0]["text"])
 
     def test_every_native_tool_has_schema_and_description(self):
-        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value".split())
+        names = set("list_apps launch_app kill_app bring_to_front get_accessibility_tree get_desktop_state get_screen_size get_cursor_position move_cursor click double_click right_click drag type_text press_key hotkey set_window_frame verify_state clipboard_read clipboard_write check_permissions health_report get_config set_config start_session end_session get_session_state set_agent_cursor_enabled set_agent_cursor_theme set_agent_cursor_motion get_agent_cursor_state start_recording stop_recording get_recording_state replay_trajectory invoke_menu set_value run_steps".split())
         catalog = {tool["name"]: tool for tool in server.schemas()}
         self.assertEqual(names, set(self.native.PROPERTIES))
         self.assertEqual(len(server.BASE_TOOLS), len(set(server.BASE_TOOLS)))
@@ -1167,6 +1167,46 @@ class NativePortTests(unittest.TestCase):
             self.assertFalse(replay["ok"])
             self.assertIn("human_activity", replay["results"][0]["content"][0]["text"])
             self.assertEqual(len(sent(run, "click")), 1)
+
+    def test_run_steps_stops_at_the_first_failure_and_looks_once(self):
+        # Acting and looking used to be separate round trips with the window free to change between them.
+        steps = [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                 {"tool": "type_text", "arguments": {"window_id": 0x1234, "text": "Ada"}}]
+        observe = {"target_pid": 4321, "target_window_id": 0x1234}
+        with patch.object(server, "list_windows", return_value=[self.window]), patch.object(
+            server, "screenshot_png", return_value=png(800, 600)
+        ), patch.object(server, "run_cli", return_value="") as run:
+            done = server.call_tool("run_steps", {"steps": steps, "observe": observe})
+            self.assertFalse(done["isError"])
+            output = json.loads(done["content"][0]["text"])
+            self.assertEqual((output["completed"], [item["tool"] for item in output["results"]]), (2, ["click", "type_text"]))
+            self.assertEqual(done["content"][1]["type"], "image")
+            self.assertIn("state_token", json.loads(done["content"][2]["text"]))
+            run.reset_mock()
+            # Nothing after the failed step may run.
+            stopped = server.call_tool("run_steps", {"steps": [steps[0], {"tool": "screenshot", "arguments": {**observe, "width": 900}}, steps[0]]})
+            self.assertTrue(stopped["isError"])
+            halted = json.loads(stopped["content"][0]["text"])
+            self.assertEqual((halted["failed_step"], len(halted["results"])), (1, 2))
+            self.assertIn("unknown argument: width", halted["results"][1]["text"])
+            self.assertEqual(len(sent(run, "click")), 1)
+            # A step cannot start another loop of its own.
+            for nested in ("run_steps", "replay_trajectory", "no_such_tool"):
+                with self.subTest(nested=nested):
+                    self.assertTrue(server.call_tool("run_steps", {"steps": [{"tool": nested, "arguments": {}}]})["isError"])
+            with self.assertRaises(ValueError):
+                server.call_tool("run_steps", {"steps": []})
+
+    def test_run_steps_records_each_step_as_its_own_turn(self):
+        # A recording of run_steps must replay its steps, not one opaque call that replay refuses.
+        with tempfile.TemporaryDirectory() as directory, patch.object(self.native, "root_png", return_value=b"png"), patch.object(
+            server, "list_windows", return_value=[self.window]
+        ), patch.object(server, "run_cli", return_value=""):
+            self.value("start_recording", {"output_dir": directory})
+            server.call_tool("run_steps", {"steps": [{"tool": "click", "arguments": {"window_id": 0x1234, "x": 1, "y": 2}},
+                                                     {"tool": "press_key", "arguments": {"window_id": 0x1234, "key": "Return"}}]})
+            turns = sorted(Path(directory).glob("turn-*"))
+            self.assertEqual([json.loads((turn / "action.json").read_text())["name"] for turn in turns], ["click", "press_key"])
 
     def test_health_reports_missing_idle_check(self):
         with patch.object(server.shutil, "which", return_value=None):
